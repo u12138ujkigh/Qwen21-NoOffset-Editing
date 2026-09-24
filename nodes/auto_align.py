@@ -18,9 +18,9 @@ import torch
 from comfy_api.latest import io
 
 try:
-    from .resize_pad import ImageInfo
+    from .resize_pad import ImageInfo, parse_image_info as _parse_image_info
 except ImportError:  # 兼容不同包导入环境
-    from nodes.resize_pad import ImageInfo
+    from nodes.resize_pad import ImageInfo, parse_image_info as _parse_image_info
 
 
 def _to_gray(t):
@@ -63,6 +63,56 @@ def _overlap_ncc(ref, img, dy, dx):
     if sa < 1e-6 or sb < 1e-6:
         return -1.0
     return float((a * b).mean() / (sa * sb))
+
+
+def _ceil32(v):
+    """向上取整到 32 的倍数（「调整图像尺寸填充」target_size=0 的规则）。"""
+    return -(-int(v) // 32) * 32
+
+
+def _round32(v):
+    """四舍五入到 32 的倍数（原生 TextEncodeQwenImage21 的规则）。"""
+    return int(round(int(v) / 32)) * 32
+
+
+def _diagnose_domain_mismatch(iw, ih, rw, rh, crop_to_reference):
+    """两路尺寸不一致时，追加一段「可能的错位来源」提示，便于用户自查接线。"""
+    tips = []
+    il, rl = max(iw, ih), max(rw, rh)
+    same_min = abs(min(iw, ih) - min(rw, rh)) <= 32
+    # 情形一：两路是同一张图，只是 32 对齐的取整规则不同（长边差 ≤ 32）
+    # —— 这是最常见的「假错位」，两路其实同图，只是一个做了 32 上取整 / 四舍五入
+    if same_min and 0 < abs(il - rl) <= 32:
+        lo, hi = min(il, rl), max(il, rl)
+        rule = None
+        if _ceil32(lo) == hi:
+            rule = "按 32 向上取整（「调整图像尺寸填充」target_size=0）"
+        elif _round32(lo) == hi:
+            rule = "四舍五入到 32 倍数（原生 TextEncodeQwenImage21）"
+        if rule:
+            tips.append(
+                f"较大的一侧长边 {hi} 恰好等于另一侧长边 {lo} {rule}的结果 —— "
+                "两路很可能是同一张图，只是走了不同的 32 对齐路径。"
+                "请让 reference_image 与 image 走同一个尺寸域。"
+            )
+        else:
+            tips.append(
+                f"两路长边只差 {abs(il - rl)}（{il} vs {rl}），像是同一张图分别做了 32 倍数对齐，"
+                "请检查两路是否走了不同的缩放/填充节点。"
+            )
+    # 情形二：两路长边差异较大，说明来自不同的输入图
+    elif abs(il - rl) > 32:
+        tips.append(
+            f"两路长边差距较大（image {il} vs reference {rl}），"
+            "通常意味着它们来自不同的输入图 —— "
+            "请确认 reference_image 接的是与 image 同尺寸域的那一路。"
+        )
+    # 情形三：多图参考场景（batch 内尺寸不齐）
+    if crop_to_reference:
+        tips.append("当前 crop_to_reference=True：若参考图来自裁剪后的原图域，请关闭该选项。")
+    if not tips:
+        return ""
+    return "\n【诊断】" + "\n· ".join([""] + tips)
 
 
 def _estimate_shift(ref, img, max_shift):
@@ -119,21 +169,27 @@ class AutoAlignToReferenceNode(io.ComfyNode):
             display_name="自动对齐到参考图",
             category="txtnode",
             inputs=[
-                io.Image.Input("image"),
-                io.Image.Input("reference_image"),
-                io.Int.Input("max_shift", default=64, min=0, max=512, step=8),
+                io.Image.Input("image", display_name="编辑输出"),
+                io.Image.Input("reference_image", display_name="参考原图"),
+                io.Int.Input("max_shift", default=64, min=0, max=512, step=8,
+                             display_name="最大位移（像素）",
+                             tooltip="在此范围内搜索位移；模型固有位移约 16~32px，64 足够"),
                 # True：不平移，直接切对齐窗口（零复制边缘）；配合 image_info 使用，
                 # 本节点放在「移除图像填充」之前（padded 域）
-                io.Boolean.Input("crop_to_reference", default=False),
+                io.Boolean.Input("crop_to_reference", default=False,
+                                 display_name="裁剪到参考域",
+                                 tooltip="开启后不再平移，直接切出对齐窗口（零复制边缘），输出回到原图域"),
                 # FFT 峰相关度低于该值时认为位移不可信、保持原图不动（0 = 总是校正）
-                io.Float.Input("min_confidence", default=0.0, min=0.0, max=1.0, step=0.05),
+                io.Float.Input("min_confidence", default=0.0, min=0.0, max=1.0, step=0.05,
+                               display_name="位移可信度下限",
+                               tooltip="FFT 峰相关度低于该值时认为位移不可信、保持不动；0 = 总是校正"),
                 # 调整图像尺寸填充的元数据：crop 模式下提供内容区几何与输出尺寸
-                ImageInfo.Input("image_info", optional=True),
+                ImageInfo.Input("image_info", optional=True, display_name="填充元数据"),
             ],
             outputs=[
-                io.Image.Output("image"),
-                io.Int.Output("shift_dx"),
-                io.Int.Output("shift_dy"),
+                io.Image.Output("image", display_name="对齐后图像"),
+                io.Int.Output("shift_dx", display_name="水平位移"),
+                io.Int.Output("shift_dy", display_name="垂直位移"),
             ],
         )
 
@@ -146,28 +202,33 @@ class AutoAlignToReferenceNode(io.ComfyNode):
         arr = image.detach().cpu().numpy()
 
         if ref.shape != img_frames[0].shape:
+            ih, iw = img_frames[0].shape
+            rh, rw = ref.shape
+            # 常见的「尺寸域错位」诊断：看两路是否只是 32 倍数取整的差异
+            hint = _diagnose_domain_mismatch(iw, ih, rw, rh, crop_to_reference)
             raise ValueError(
-                f"自动对齐到参考图：image {img_frames[0].shape[1]}x{img_frames[0].shape[0]} 与 "
-                f"reference_image {ref.shape[1]}x{ref.shape[0]} 尺寸不一致。"
+                f"自动对齐到参考图：image {iw}x{ih} 与 "
+                f"reference_image {rw}x{rh} 尺寸不一致。"
                 "两路必须同域：crop 模式下 reference_image 接「调整图像尺寸填充」的 "
                 "output_image（padded 域）、image 接同域的解码输出；"
                 "若参考图来自裁剪后的原图域，请关闭 crop_to_reference。"
+                + hint
             )
 
-        # crop 模式解析内容区几何：(left, top, right, bottom, canvas_size)
+        # crop 模式解析内容区几何：(left, top, right, bottom, canvas_w, canvas_h)
+        # 兼容旧 5 元组 (…, canvas) —— 那种情况两轴都取该值（方形画布）。
         origin = None
         win = None
         if crop_to_reference and image_info is not None:
-            info = image_info
-            if isinstance(info, (list, tuple)) and info and isinstance(info[0], (list, tuple)):
-                info = info[0]
-            left, top, right, bottom, canvas = [int(v) for v in info[:5]]
-            if canvas > 1 and right >= 0 and bottom >= 0:
-                win_h = canvas - top - bottom
-                win_w = canvas - left - right
-                if 0 < win_h <= arr.shape[1] and 0 < win_w <= arr.shape[2]:
-                    origin = (top, left)
-                    win = (win_h, win_w)
+            parsed = _parse_image_info(image_info)
+            if parsed is not None:
+                left, top, right, bottom, canvas_w, canvas_h = parsed
+                if canvas_w > 1 and canvas_h > 1 and right >= 0 and bottom >= 0:
+                    win_h = canvas_h - top - bottom
+                    win_w = canvas_w - left - right
+                    if 0 < win_h <= arr.shape[1] and 0 < win_w <= arr.shape[2]:
+                        origin = (top, left)
+                        win = (win_h, win_w)
 
         outs = []
         dx_out = dy_out = 0

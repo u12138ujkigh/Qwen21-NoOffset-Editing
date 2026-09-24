@@ -30,21 +30,48 @@ git clone https://github.com/u12138ujkigh/Qwen21-NoOffset-Editing.git
 
 ### 1. 调整图像尺寸填充（Resize and Pad Image）— 增强版
 
-将图像等比缩放并居中填充到方形画布，输出 `output_image` 与填充元数据 `image_info`（五元组：左/上/右/下补边宽度、画布尺寸）。
+将图像等比缩放并填充到画布，输出 `output_image` 与填充元数据 `image_info`
+（六元组：左/上/右/下补边宽度、**画布宽**、**画布高**；旧版是单一边长的五元组，下游两种都认）。
 
 | 参数 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `target_size` | INT | 1024 | 画布边长；**0 = 自动**（长边向上取整到 32 的倍数） |
+| `target_size` | INT | 1024 | 边长/长边上限；**0 = 自动**（1:1 档为长边向上取整到 32 的倍数，比例档为不缩放） |
 | `resolution_multiple` | INT | 8 | 将 target_size 吸附到该值的倍数；0 = 不吸附 |
 | `upscale_method` | COMBO | lanczos | lanczos / bicubic / area / nearest |
 | `resize_and_pad` | BOOLEAN | True | 关闭时旁路（原样输出） |
 | `background_color` | STRING | #000000 | 补边颜色；**`transparent`** = 透明补边（输出 RGBA） |
 | `scale_mode` | COMBO | fill_target | `fill_target` = 等比缩放至恰好放入画布；**`no_upscale`** = 只缩不放大 |
+| **`pad_mode`** | COMBO | 1:1（方形画布） | **画布模式**：`1:1（方形画布）` / `16 的倍数` / `32 的倍数` |
+
+**画布模式（新增）**
+
+| 档位 | 画布 | 补边位置 | 说明 |
+|---|---|---|---|
+| `1:1（方形画布）` | 正方形，边长 = `target_size` 或长边向上取整到 32 的倍数 | 居中 | **旧行为**，与之前逐像素一致 |
+| `16 的倍数` | 保持比例，宽高各自向上取整到 16 的倍数 | **只在右/下** | 面积最小；但见下方硬约束 |
+| `32 的倍数` | 同上，取 32 的倍数 | **只在右/下** | **推荐**：与核心编码节点的取整一致 |
+
+后两档的好处：
+1. **省时间**——不再方形化，竖图省 30%~45% 的 latent token（例：1200×1746 由 1760² 降到 1216×1760）；
+2. **内容原点落在 latent 网格上**——只在右/下补边意味着内容固定在 `(0,0)`，
+   而居中填充会让内容原点偏移半格（例：1200×1746 进 1760 方画布时 `pad_left=280`，280 % 16 = 8）。
+
+> ⚠️ **硬约束：画布宽高必须是 32 的倍数。** 核心 `TextEncodeQwenImage21` 在 `resolution = 0`
+> 时按 `round(dim / 32) * 32` 计算 latent 尺寸，所以画布宽 1200 会被它算成 1216，与画布不符，
+> 下游「自动对齐到参考图」会报尺寸不一致。
+> 因此 **`16 的倍数` 档位在核心编码节点下不可用**（节点会打印明确警告），
+> 除非换成 16 对齐的文本编码节点。`32 的倍数` 档位无此问题，且已能拿到 30.9% 的省时收益
+> （16 档是 31.8%，只多 0.9 个百分点）。
+
+背景：`qwen_image_2.1_vae_bf16` 实测 `downscale_ratio = 16`、`latent_channels = 64`，
+即 **16px = 1 个 latent 单元**；尺寸不是 16 的倍数时 VAE 会**向下截断**
+（`1200×1746 → latent 75×109 → 解码 1200×1744`，底部丢 2 行）。
 
 **相对原插件的增强**（无偏移管线的关键）：
 
-- `scale_mode = no_upscale` + `target_size = 0`：内容**零重采样**方形化——内容像素 1:1 进入 padded 画布，编辑后可与原图逐像素比对；
-- `background_color = transparent`：透明补边，避免黑色补边被模型当成「画面内容」重绘出杂物。
+- `scale_mode = no_upscale` + `target_size = 0`：内容**零重采样**——内容像素 1:1 进入画布，编辑后可与原图逐像素比对；
+- `background_color = transparent`：透明补边，避免黑色补边被模型当成「画面内容」重绘出杂物；
+- `pad_mode`：见上，画布形状/倍数可选。
 
 ### 2. 移除图像填充（Remove Pad from Image）
 
@@ -85,7 +112,8 @@ git clone https://github.com/u12138ujkigh/Qwen21-NoOffset-Editing.git
                  └── output_image ──▶ (reference_image) ─────────────────┘
 ```
 
-1. **零重采样方形化**：调整图像尺寸填充，`scale_mode = no_upscale`、`target_size = 0`、`background_color = transparent`——内容像素 1:1 进入方形画布，补边透明；
+1. **零重采样填充**：调整图像尺寸填充，`scale_mode = no_upscale`、`target_size = 0`、`background_color = transparent`——内容像素 1:1 进入画布，补边透明。
+   画布用 `pad_mode = 32 的倍数`（保持比例、只在右/下补边）比 `1:1（方形画布）` 少 30%~45% 的 latent token，且内容原点严格落在 latent 网格上；
 2. **正常编辑**：VAE 编码 → KSampler（Qwen Image Edit）→ VAE 解码。模型在 padded 域创作，补边区也会被重绘（属正常，裁剪模式会把它裁掉）；
 3. **对齐即裁剪**：自动对齐到参考图，`crop_to_reference = True`，`reference_image` 接 padded 域原图、`image_info` 接元数据——FFT 找出模型引入的 16~32px 位移，直接切回与原图 1:1 的内容窗口；
 4. **输出**：尺寸 = 原图内容区尺寸，像素 1:1，无复制条纹、无错位。

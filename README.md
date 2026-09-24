@@ -30,21 +30,46 @@ Restart ComfyUI. Nodes appear under the `txtnode` category.
 
 ### 1. Resize and Pad Image (enhanced)
 
-Scales the image proportionally and center-pads it onto a square canvas, outputting `output_image` plus padding metadata `image_info` (5-tuple: left/top/right/bottom padding and canvas size).
+Scales the image proportionally and pads it onto a canvas, outputting `output_image` plus padding metadata `image_info` (6-tuple: left/top/right/bottom padding, **canvas width**, **canvas height**; the old single-side 5-tuple is still accepted downstream).
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `target_size` | INT | 1024 | Canvas side; **0 = auto** (long side rounded up to a multiple of 32) |
+| `target_size` | INT | 1024 | Side / long-side cap; **0 = auto** (1:1 mode: long side rounded up to a multiple of 32; aspect modes: no rescale) |
 | `resolution_multiple` | INT | 8 | Snaps target_size to a multiple of this; 0 = disable |
 | `upscale_method` | COMBO | lanczos | lanczos / bicubic / area / nearest |
 | `resize_and_pad` | BOOLEAN | True | Off = bypass (pass-through) |
 | `background_color` | STRING | #000000 | Pad color; **`transparent`** = transparent padding (RGBA output) |
 | `scale_mode` | COMBO | fill_target | `fill_target` = scale to fit exactly; **`no_upscale`** = shrink only, never enlarge |
+| **`pad_mode`** | COMBO | 1:1 (square) | **Canvas mode**: `1:1（方形画布）` / `16 的倍数` / `32 的倍数` |
+
+**Canvas modes (new)**
+
+| Mode | Canvas | Padding side | Notes |
+|---|---|---|---|
+| `1:1（方形画布）` | Square, side = `target_size` or long side rounded up to a multiple of 32 | centered | **Legacy behaviour**, pixel-identical to before |
+| `16 的倍数` | Aspect preserved, each axis rounded up to a multiple of 16 | **right/bottom only** | Smallest area; see the hard constraint below |
+| `32 的倍数` | Same, multiple of 32 | **right/bottom only** | **Recommended**: matches the core encoder's rounding |
+
+Benefits of the two aspect modes:
+1. **Faster** — no more squaring; a portrait image saves 30–45% of latent tokens (e.g. 1200×1746 goes from 1760² to 1216×1760);
+2. **Content origin lands on the latent grid** — padding only right/bottom keeps content pinned at `(0,0)`, whereas centered padding offsets the origin by up to half a cell (e.g. 1200×1746 in a 1760 square gives `pad_left=280`, and 280 % 16 = 8).
+
+> ⚠️ **Hard constraint: canvas width/height must be a multiple of 32.** With `resolution = 0`, the core
+> `TextEncodeQwenImage21` computes the latent size as `round(dim / 32) * 32`, so a canvas width of 1200
+> becomes 1216 — mismatching the canvas, and "Auto Align to Reference" then reports inconsistent sizes.
+> Therefore the **`16 的倍数` mode is unusable with the core encoder** (the node prints an explicit warning),
+> unless you switch to a 16-aligned text encoder. The `32 的倍数` mode has no such problem and already
+> captures 30.9% of the speed-up (the 16 mode would be 31.8% — only 0.9 points more).
+
+Background: measured on `qwen_image_2.1_vae_bf16`, `downscale_ratio = 16` and `latent_channels = 64`,
+i.e. **16 px = one latent cell**; a dimension that is not a multiple of 16 is **truncated** by the VAE
+(`1200×1746 → latent 75×109 → decodes to 1200×1744`, losing 2 rows at the bottom).
 
 **Enhancements over the original plugin** (key to the no-offset pipeline):
 
-- `scale_mode = no_upscale` + `target_size = 0`: **zero-resample** squaring — content enters the padded canvas pixel-for-pixel, enabling pixel-exact comparison after editing;
-- `background_color = transparent`: transparent padding, so the model does not treat black bars as "image content" and paint artifacts into them.
+- `scale_mode = no_upscale` + `target_size = 0`: **zero-resample** — content enters the canvas pixel-for-pixel, enabling pixel-exact comparison after editing;
+- `background_color = transparent`: transparent padding, so the model does not treat black bars as "image content" and paint artifacts into them;
+- `pad_mode`: selectable canvas shape / multiple, as above.
 
 ### 2. Remove Pad from Image
 
@@ -85,7 +110,7 @@ LoadImage ─▶ Resize and Pad ─▶ VAE Encode ─▶ KSampler ─▶ VAE Dec
                   └── output_image ──▶ (reference_image) ─────────────┘
 ```
 
-1. **Zero-resample squaring**: Resize and Pad with `scale_mode = no_upscale`, `target_size = 0`, `background_color = transparent` — content enters the square canvas 1:1, padding transparent;
+1. **Zero-resample padding**: Resize and Pad with `scale_mode = no_upscale`, `target_size = 0`, `background_color = transparent` — content enters the canvas 1:1, padding transparent. Using `pad_mode = 32 的倍数` (aspect preserved, padding only right/bottom) costs 30–45% fewer latent tokens than `1:1（方形画布）` and keeps the content origin exactly on the latent grid;
 2. **Edit normally**: VAE Encode → KSampler (Qwen Image Edit) → VAE Decode. The model works in the padded domain and will repaint the padded area too (normal — crop mode removes it);
 3. **Align-then-crop**: Auto Align to Reference with `crop_to_reference = True`, `reference_image` from the padded original, `image_info` from its metadata — FFT finds the 16–32 px shift introduced by the model and slices the window back to a 1:1 match with the original;
 4. **Output**: size = original content size, pixels 1:1, no copy streaks, no misalignment.
