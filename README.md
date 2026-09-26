@@ -26,6 +26,25 @@ Restart ComfyUI. Nodes appear under the `txtnode` category.
 
 > ⚠️ **Compatibility warning**: node IDs are identical to Comfyui-txtnode (`ResizeAndPadNode` / `RemovePadFromImageNode` / `AutoAlignToReferenceNode`). **Do not install both packages** (or any txtnode variant) at the same time — node definitions will conflict.
 
+## Recommended Settings
+
+In one line: **the official model wants `32 的倍数`; 红潮 (the fine-tuned build) wants `32 的倍数（四周留边）` with a margin of 32.**
+
+| Model | Canvas mode | Margin | Why |
+|---|---|---|---|
+| **Official Qwen-Image 2.1**<br>`qwen_image_2.1_int8_convrot.safetensors` | **`32 的倍数`** | not used | The stock weights barely drift at all (measured **−0.01 / +0.71 px**), so no correction room is needed. This mode gives the smallest canvas and the fewest latent tokens — a free ~30% speed-up |
+| **红潮** (fine-tuned build)<br>`redqw21UNLOCKED…_int8.safetensors` | **`32 的倍数（四周留边）`** | **32** | 红潮 is a redirected fine-tune and **drifts left systematically** (measured 24–42 px). The margin *is* the maximum drift the aligner can correct on that axis — with no left/top room the shift can never be undone |
+
+Everything else is identical for both models: `target_size = 0`, `resolution_multiple = 0`,
+`upscale_method = lanczos`, `scale_mode = no_upscale`, `background_color = transparent`;
+for Auto Align to Reference use `crop_to_reference = True` and `max_shift = 64`.
+
+> A margin of 32 covers the large majority of cases, but it is not a guarantee — the drift varies with
+> the **content**, not just the model (24 → 42 px on the same model). When it is not enough you do not
+> have to guess: Auto Align to Reference prints **how many pixels are missing and the exact margin to
+> set** (the 10 px residual case is told to use 64). So **32 is the recommended value and 64 the
+> fallback**.
+
 ## Nodes
 
 ### 1. Resize and Pad Image (enhanced)
@@ -41,7 +60,7 @@ Scales the image proportionally and pads it onto a canvas, outputting `output_im
 | `background_color` | STRING | #000000 | Pad color; **`transparent`** = transparent padding (RGBA output) |
 | `scale_mode` | COMBO | fill_target | `fill_target` = scale to fit exactly; **`no_upscale`** = shrink only, never enlarge |
 | **`pad_mode`** | COMBO | 1:1 (square) | **Canvas mode**: `1:1（方形画布）` / `16 的倍数` / `32 的倍数` / `32 的倍数（四周留边）` / `1:1（四周留边）` / `32 的倍数（四边自定义）` |
-| **`edge_margin`** | INT | 64 | Margin per side, used by the two `四周留边` modes (0–512, **step 8**). **The left/top room is exactly the value you set** — the content is placed flush against the left/top edge and the ceil-to-32 slack all lands on the right/bottom, so this value is also the maximum drift the aligner can correct on the left/top axes |
+| **`edge_margin`** | INT | 64 | Margin per side, used by the two `四周留边` modes (0–512, **step 8**). **The left/top room is exactly the value you set** — the content is placed flush against the left/top edge and the ceil-to-32 slack all lands on the right/bottom, so this value is also the maximum drift the aligner can correct on the left/top axes. The node default is **64** (more headroom than the recommended 32 for 红潮; harmless either way, and unused by the official model) |
 | **`margin_left` / `margin_top` / `margin_right` / `margin_bottom`** | INT | 0 | Per-side margins (px, step 8), used by `32 的倍数（四边自定义）` only. **Pad only the sides your model actually drifts towards** — the same canvas area buys a larger margin on that side |
 
 **Canvas modes**
@@ -80,17 +99,22 @@ switching back to the matching mode restores them and existing workflows keep th
 > NCC 0.99986, drift all zero). So an origin that is *not* on the 16/32 grid does **not** make the
 > VAE drift by itself. The latent spatial compression is 16, i.e. 8 px = half a latent cell.
 
-> ✅ **Use `32 的倍数（四周留边）` with a margin of 64.** The margin *is* the maximum drift the aligner
-> can correct on that axis: **the left/top room equals exactly the value you set**, so a margin of 32 can
-> only correct 32 px (the right/bottom sides get a little extra from the ceil-to-32 slack — never rely on
-> it). A fine-tuned Qwen 2.1 shifting **42 px left** on a 964×1280 image leaves a 10 px gap at a margin
-> of 32 (measured residual **10 px left**) and drops to **0** at 64. Use 96 for models that drift further.
-> If you specifically need a square canvas, use `1:1（四周留边）` with the same margin.
+> ✅ **红潮 (the fine-tuned build) should use `32 的倍数（四周留边）` with a margin of 32; the official model
+> should use `32 的倍数` and needs no margin at all.** The margin *is* the maximum drift the aligner can
+> correct on that axis: **the left/top room equals exactly the value you set**, so a margin of 32 can only
+> correct 32 px (the right/bottom sides get a little extra from the ceil-to-32 slack — never rely on it).
+> The stock model measured **−0.01 / +0.71 px**, so the `32 的倍数` mode is more than enough and any margin
+> is wasted canvas and wasted compute. 红潮, on the other hand, always drifts left: **24/11 px** on a
+> 983×1280 image and **42 px** on a 964×1280 one — 42 > 32, so at a margin of 32 that image leaves a 10 px
+> gap, cannot take it from outside the canvas and comes out **10 px left**; at 64 the residual is **0**.
+> Hence **32 is the recommended value and 64 the fallback**: start at 32, and if a residual shows up,
+> follow the warning's suggested value (96 for models that drift even further).
+> If you specifically need a square canvas, use `1:1（四周留边）` with the same margin of 32.
 > **To save area**, use `32 的倍数（四边自定义）` when the drift direction is fixed (here: always left):
 > pad only left 64 / top 32 and leave right/bottom at 0 — the canvas becomes 1056×**1312**, **2.4% smaller**
 > than "32 on all four sides" (1056×1344), yet the left room is 64; measured zero-shift NCC = **1.0000**.
 > The trade-off is zero correction room on the right/bottom — pad those too if your model drifts that way.
-> The bundled workflow already ships with `32 的倍数（四周留边）` + 64.
+> The bundled workflow already ships with `32 的倍数（四周留边）` + 32.
 
 Benefits of the aspect modes:
 1. **Faster** — no more squaring; a landscape image saves ~37% of latent tokens (2752×1536 goes from 2752² to 2880×1664), a portrait one 30–45% (1200×1746 goes from 1760² to 1216×1760);
@@ -192,7 +216,7 @@ LoadImage ─▶ Resize and Pad ─▶ VAE Encode ─▶ KSampler ─▶ VAE Dec
 
 > 💡 **Large-image protection**: for very large inputs, insert a "Scale Image to Suitable Size" node (e.g. 1.5 MP) before "Resize and Pad Image" to lower the editing resolution — it only affects the editing domain; the crop-mode output size is still governed by `image_info`, so alignment is unaffected.
 
-**Ready-to-use workflow**: [`workflow/Qwen21_无偏移编辑_像素1比1.json`](workflow/Qwen21_无偏移编辑_像素1比1.json) — drag it into ComfyUI (requires a local Qwen Image 2.1 model). The canvas is already set to the recommended **`32 的倍数（四周留边）` with a 64 px margin**, nothing to tune.
+**Ready-to-use workflow**: [`workflow/Qwen21_无偏移编辑_像素1比1.json`](workflow/Qwen21_无偏移编辑_像素1比1.json) — drag it into ComfyUI (requires a local Qwen Image 2.1 model). The canvas is already set to **`32 的倍数（四周留边）` with a 32 px margin**, which works out of the box for both the official model and 红潮; if you only ever run the official model, switching the canvas mode to `32 的倍数` saves a little more area and time (see "Recommended Settings" above).
 
 ## Credits & Attribution
 
