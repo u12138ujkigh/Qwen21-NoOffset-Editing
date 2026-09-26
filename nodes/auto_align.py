@@ -12,6 +12,14 @@
   无任何复制填充。image_info 提供内容区几何（来自调整图像尺寸填充），
   输出尺寸 = 原图域尺寸；此时本节点应放在「移除图像填充」之前
   （padded 域），reference_image 接「调整图像尺寸填充」的输出。
+
+⚠ 往左/上漂移的**硬前提**：crop 模式的窗口起点 = 内容原点 + 位移。若模型把内容
+往左/上推，起点是负数，会被 clamp 回 0 —— 校正量被静默吃掉，表现为「输出整体
+往左/上偏，且怎么调都没用」。所以此时画布在左/上必须有留边：
+「调整图像尺寸填充」请选「32 的倍数（四周留边）」或「1:1（四周留边）」档位
+（留边 ≥ 模型漂移量）。纯右/下补边的档位、以及贴边居中的旧「1:1（方形画布）」
+档位只在模型往右/下漂移时才有校正能力。
+命中这种情况时本节点会打印明确的修复指引，不再静默通过。
 """
 import numpy as np
 import torch
@@ -151,12 +159,40 @@ def _crop_aligned(arr, dx, dy, win_h, win_w, origin):
     (oy, ox) 为参考内容区在 arr 坐标系中的左上角，(win_h, win_w) 为窗口尺寸。
     窗口起点 clamp 到图像内 —— 无边缘复制填充（极少量越界时窗口整体
     平移 clamp，牺牲亚窗口精度换取干净边缘）。
+
+    返回 (窗口, 是否精确)。「精确」= 窗口起点没有被 clamp 掉所需位移。
+    clamp 一旦发生，说明该方向**没有留边**，校正量会静默丢失
+    （表现就是「模型往左漂 16px，输出就往左偏 16px」），调用方必须据此告警。
     """
     H, W = arr.shape[:2]
     oy, ox = origin
-    y0 = int(np.clip(oy + dy, 0, max(0, H - win_h)))
-    x0 = int(np.clip(ox + dx, 0, max(0, W - win_w)))
-    return arr[y0 : y0 + win_h, x0 : x0 + win_w]
+    need_y, need_x = oy + dy, ox + dx
+    y0 = int(np.clip(need_y, 0, max(0, H - win_h)))
+    x0 = int(np.clip(need_x, 0, max(0, W - win_w)))
+    exact = (y0 == need_y and x0 == need_x)
+    return arr[y0 : y0 + win_h, x0 : x0 + win_w], exact
+
+
+def _warn_insufficient_margin(dx, dy):
+    """crop 模式因留边不足而无法校正位移时，给出可直接照做的修复指引。"""
+    dirs = []
+    if dx < 0:
+        dirs.append("左")
+    elif dx > 0:
+        dirs.append("右")
+    if dy < 0:
+        dirs.append("上")
+    elif dy > 0:
+        dirs.append("下")
+    need = max(abs(dx), abs(dy))
+    print(
+        "[自动对齐到参考图] 检测到内容向 %s 偏移 %dpx，但裁剪窗口被夹回画布边界，"
+        "**校正量已丢失** —— 这正是输出看起来仍然偏移的原因。\n"
+        "  修复：把「调整图像尺寸填充」的画布模式改成「32 的倍数（四周留边）」或"
+        "「1:1（四周留边）」，"
+        "并把「四周留边」设为不小于 %d（必须是 32 的倍数，32~64 一般够用）。"
+        % ("/".join(dirs) or "?", need, need)
+    )
 
 
 class AutoAlignToReferenceNode(io.ComfyNode):
@@ -230,15 +266,40 @@ class AutoAlignToReferenceNode(io.ComfyNode):
                         origin = (top, left)
                         win = (win_h, win_w)
 
+        if crop_to_reference and win is None:
+            print(
+                "[自动对齐到参考图] 已开启「裁剪到参考域」但没有可用的填充元数据，"
+                "将退化为整图平移校正（边缘会出现复制条纹）。"
+                "请把「填充元数据」接到「调整图像尺寸填充」的 image_info 输出。"
+            )
+
+        # 位移估计只在「内容窗口」内做：参考图里补边区是空的（透明 ⇒ RGB 全 0），
+        # 而模型会把那块也画上内容 —— 拿整张画布做互相关会被这块「假内容」拉低峰的
+        # 可信度、甚至带偏峰位。裁到内容窗后两边都是真内容，估计才干净。
+        if win is not None:
+            oy, ox = origin
+            ref_probe = ref[oy:oy + win[0], ox:ox + win[1]]
+        else:
+            ref_probe = ref
+
         outs = []
         dx_out = dy_out = 0
         for i in range(arr.shape[0]):
-            dx, dy, score = _estimate_shift(ref, _norm(img_frames[i]), max_shift)
+            frame = _norm(img_frames[i])
+            if win is not None:
+                oy, ox = origin
+                frame_probe = frame[oy:oy + win[0], ox:ox + win[1]]
+            else:
+                frame_probe = frame
+            dx, dy, score = _estimate_shift(ref_probe, frame_probe, max_shift)
             if score < min_confidence:
                 dx = dy = 0
             dx_out, dy_out = dx, dy
             if crop_to_reference and win is not None:
-                outs.append(_crop_aligned(arr[i], dx, dy, win[0], win[1], origin))
+                crop, exact = _crop_aligned(arr[i], dx, dy, win[0], win[1], origin)
+                if not exact:
+                    _warn_insufficient_margin(dx, dy)
+                outs.append(crop)
             else:
                 outs.append(_shift(arr[i], dx, dy))
         result = torch.from_numpy(np.stack(outs).astype(np.float32))

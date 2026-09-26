@@ -40,26 +40,58 @@ Scales the image proportionally and pads it onto a canvas, outputting `output_im
 | `resize_and_pad` | BOOLEAN | True | Off = bypass (pass-through) |
 | `background_color` | STRING | #000000 | Pad color; **`transparent`** = transparent padding (RGBA output) |
 | `scale_mode` | COMBO | fill_target | `fill_target` = scale to fit exactly; **`no_upscale`** = shrink only, never enlarge |
-| **`pad_mode`** | COMBO | 1:1 (square) | **Canvas mode**: `1:1（方形画布）` / `16 的倍数` / `32 的倍数` |
+| **`pad_mode`** | COMBO | 1:1 (square) | **Canvas mode**: `1:1（方形画布）` / `16 的倍数` / `32 的倍数` / `32 的倍数（四周留边）` / `1:1（四周留边）` |
+| **`edge_margin`** | INT | 32 | Margin per side, used by the two `四周留边` modes (0–512, step 32); snapped to a multiple of 32 |
 
-**Canvas modes (new)**
+**Canvas modes**
 
 | Mode | Canvas | Padding side | Notes |
 |---|---|---|---|
-| `1:1（方形画布）` | Square, side = `target_size` or long side rounded up to a multiple of 32 | centered | **Legacy behaviour**, pixel-identical to before |
-| `16 的倍数` | Aspect preserved, each axis rounded up to a multiple of 16 | **right/bottom only** | Smallest area; see the hard constraint below |
-| `32 的倍数` | Same, multiple of 32 | **right/bottom only** | **Recommended**: matches the core encoder's rounding |
+| `1:1（方形画布）` | Square, side = `target_size` or long side rounded up to a multiple of 32 | centered | **Legacy behaviour**, pixel-identical to before. ⚠️ Cannot correct drift on the axis where the content side equals the canvas side — horizontal for a typical landscape, **vertical for a typical portrait** (983×1280 → 1280×1280, `pad_top = 0`). A 983×1280 portrait gets 148 px of horizontal room yet still comes out **11 px high** — see below |
+| `16 的倍数` | Aspect preserved, each axis rounded up to a multiple of 16 | **right/bottom only** | Smallest area; unusable with the core encoder, see the hard constraint below |
+| `32 的倍数` | Same, multiple of 32 | **right/bottom only** | Smaller area; **zero left/top room**, so left/up drift cannot be corrected |
+| `32 的倍数（四周留边）` | Aspect preserved, `edge_margin` on all four sides, then rounded up to a multiple of 32 | **all four sides** | **Recommended for the no-offset pipeline**: content origin stays on the latent grid *and* every direction has room to correct drift |
+| `1:1（四周留边）` | Square, side = long side rounded up to a multiple of 32 **plus 2 × `edge_margin`** | **all four sides** | Same drift protection while keeping a (larger) square canvas: 983×1280 → 1344² vs 1056×1344 for the aspect mode |
 
-Benefits of the two aspect modes:
-1. **Faster** — no more squaring; a portrait image saves 30–45% of latent tokens (e.g. 1200×1746 goes from 1760² to 1216×1760);
-2. **Content origin lands on the latent grid** — padding only right/bottom keeps content pinned at `(0,0)`, whereas centered padding offsets the origin by up to half a cell (e.g. 1200×1746 in a 1760 square gives `pad_left=280`, and 280 % 16 = 8).
+> ✅ **Use a 32 px canvas margin.** Pick canvas mode **`32 的倍数（四周留边）`** and set the margin to **32**
+> (64 if your model drifts further) — it is the only mode that leaves correction room on all four sides.
+> Example: a 983×1280 image → canvas 1056×1344, 32 px of room per side, residual output shift **0/0**.
+> If you specifically need a square canvas, use `1:1（四周留边）` with the same margin of 32
+> (canvas 1344×1344, more VRAM). The bundled workflow already ships with this configuration.
+
+Benefits of the aspect modes:
+1. **Faster** — no more squaring; a landscape image saves ~37% of latent tokens (2752×1536 goes from 2752² to 2880×1664), a portrait one 30–45% (1200×1746 goes from 1760² to 1216×1760);
+2. **Content origin lands on the latent grid** — with `right/bottom only` the content stays pinned at `(0,0)`; the `四周留边` mode puts it at `(margin, margin)` with `margin` a multiple of 32, which is still on the grid. The legacy `1:1` mode **centers** the content, so the origin can land off-grid (e.g. 1200×1746 in a 1760 square gives `pad_left = 280`, and 280 % 32 = 24).
+
+> ⚠️ **Why `32 的倍数（四周留边）` is the recommended canvas mode.** Crop mode corrects drift by
+> starting its window at `origin + shift`. With right/bottom-only padding `origin = (0,0)`, so a left/up
+> drift makes that start negative, it gets clamped to 0 and **the correction is silently swallowed** —
+> the output stays shifted by exactly the model's own drift. The legacy `1:1` mode has the same problem
+> on the horizontal axis whenever the content width equals the canvas width (typical landscape:
+> `pad_left = pad_right = 0`, so `x0` can only ever be 0, whatever the drift direction). A fine-tuned
+> model with an inherent left drift therefore comes out *consistently shifted left*, while a stock model
+> (drift ≈ 0) looks fine. Set `edge_margin ≥ max drift` (32 is usually enough, 64 to be safe).
+> The Auto Align node now **prints an explicit warning containing this fix** whenever it detects clamping.
+>
+> 📏 **Measured on a real run** (983×1280 portrait, fine-tuned Qwen 2.1): the model shifts the content
+> **24 px left and 11 px up**. With `32 的倍数` the canvas is 992×1280 ⇒ room L/T/R/B = 0/0/9/0, so both
+> corrections are clamped away and the output keeps the full shift — the measured residual is exactly
+> **−24 / −11**. With `edge_margin = 32` (canvas 1056×1344) the residual drops to **0 / 0**, and with
+> `1:1（四周留边）` 32 (canvas 1344×1344) also **0 / 0**. Note that `max_shift = 64` was never the limit:
+> 24 px sits well inside it. The missing *margin*, not the search range, was the problem.
+>
+> ⚠️ **"Round the long side up to a multiple of 32, then square it" is *not* the same as leaving a
+> margin.** When the long side is already a multiple of 32 (e.g. 768 for a 768×715 landscape) those two
+> steps reproduce the legacy `1:1` canvas **pixel for pixel**, with zero extra room — the content ends up
+> flush against the canvas edge and no drift can be corrected in that axis. Room only appears when you
+> add `2 × edge_margin` on top, which is what the two `四周留边` modes do.
 
 > ⚠️ **Hard constraint: canvas width/height must be a multiple of 32.** With `resolution = 0`, the core
 > `TextEncodeQwenImage21` computes the latent size as `round(dim / 32) * 32`, so a canvas width of 1200
 > becomes 1216 — mismatching the canvas, and "Auto Align to Reference" then reports inconsistent sizes.
 > Therefore the **`16 的倍数` mode is unusable with the core encoder** (the node prints an explicit warning),
-> unless you switch to a 16-aligned text encoder. The `32 的倍数` mode has no such problem and already
-> captures 30.9% of the speed-up (the 16 mode would be 31.8% — only 0.9 points more).
+> unless you switch to a 16-aligned text encoder. The `32 的倍数` and `32 的倍数（四周留边）` modes have no
+> such problem and already capture ~31% of the speed-up (the 16 mode would be 31.8% — only 0.9 points more).
 
 Background: measured on `qwen_image_2.1_vae_bf16`, `downscale_ratio = 16` and `latent_channels = 64`,
 i.e. **16 px = one latent cell**; a dimension that is not a multiple of 16 is **truncated** by the VAE
@@ -87,7 +119,7 @@ Crops the padding area according to `image_info` metadata to restore the origina
 Estimates the integer-pixel shift of the edited output relative to the reference original within `max_shift`, using **FFT circular cross-correlation**, then corrects it in one of two ways:
 
 - **Shift mode** (`crop_to_reference = False`, legacy behavior): translates the whole image back into alignment; out-of-bounds areas are filled by replicating the nearest edge pixels (small shifts produce copy streaks at borders);
-- **Crop mode** (`crop_to_reference = True`, **recommended**): no translation — directly slices the window corresponding to the aligned reference content area. Every pixel inside is real content, **zero replicated fill**. Place this node in the padded domain: connect `reference_image` to the output of "Resize and Pad Image" and `image_info` to its metadata.
+- **Crop mode** (`crop_to_reference = True`, **recommended**): no translation — directly slices the window corresponding to the aligned reference content area. Every pixel inside is real content, **zero replicated fill**. Place this node in the padded domain: connect `reference_image` to the output of "Resize and Pad Image" and `image_info` to its metadata. The window starts at `origin + shift`, so that side of the canvas must have at least `|shift|` px of padding — otherwise the start falls outside the canvas, is clamped to 0 and **the correction is silently lost**. When that happens the node now prints a warning naming the affected direction(s) and the `edge_margin` to set, instead of failing quietly.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -110,14 +142,14 @@ LoadImage ─▶ Resize and Pad ─▶ VAE Encode ─▶ KSampler ─▶ VAE Dec
                   └── output_image ──▶ (reference_image) ─────────────┘
 ```
 
-1. **Zero-resample padding**: Resize and Pad with `scale_mode = no_upscale`, `target_size = 0`, `background_color = transparent` — content enters the canvas 1:1, padding transparent. Using `pad_mode = 32 的倍数` (aspect preserved, padding only right/bottom) costs 30–45% fewer latent tokens than `1:1（方形画布）` and keeps the content origin exactly on the latent grid;
+1. **Zero-resample padding**: Resize and Pad with `scale_mode = no_upscale`, `target_size = 0`, `background_color = transparent` — content enters the canvas 1:1, padding transparent. **Use a 32 px canvas margin**: `pad_mode = 32 的倍数（四周留边）` with `edge_margin = 32` (64 for models with larger drift) — or `1:1（四周留边）` when you need a square canvas: these keep the content origin on the latent grid **and** leave `edge_margin` px of room on all four sides for the aligner to crop into, while still saving 30–45% of the latent tokens of the legacy square canvas. Do **not** use `32 的倍数` (right/bottom only) or `1:1（方形画布）` for drift-prone models — both have zero room on at least one axis, so the correction gets clamped away and the output stays shifted;
 2. **Edit normally**: VAE Encode → KSampler (Qwen Image Edit) → VAE Decode. The model works in the padded domain and will repaint the padded area too (normal — crop mode removes it);
 3. **Align-then-crop**: Auto Align to Reference with `crop_to_reference = True`, `reference_image` from the padded original, `image_info` from its metadata — FFT finds the 16–32 px shift introduced by the model and slices the window back to a 1:1 match with the original;
 4. **Output**: size = original content size, pixels 1:1, no copy streaks, no misalignment.
 
 > 💡 **Large-image protection**: for very large inputs, insert a "Scale Image to Suitable Size" node (e.g. 1.5 MP) before "Resize and Pad Image" to lower the editing resolution — it only affects the editing domain; the crop-mode output size is still governed by `image_info`, so alignment is unaffected.
 
-**Ready-to-use workflow**: [`workflow/Qwen21_无偏移编辑_像素1比1.json`](workflow/Qwen21_无偏移编辑_像素1比1.json) — drag it into ComfyUI (requires a local Qwen Image 2.1 model).
+**Ready-to-use workflow**: [`workflow/Qwen21_无偏移编辑_像素1比1.json`](workflow/Qwen21_无偏移编辑_像素1比1.json) — drag it into ComfyUI (requires a local Qwen Image 2.1 model). The canvas is already set to the recommended **`32 的倍数（四周留边）` with a 32 px margin**, nothing to tune.
 
 ## Credits & Attribution
 

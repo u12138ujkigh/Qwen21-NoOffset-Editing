@@ -103,14 +103,30 @@ class ResizeAndPadNode(io.ComfyNode):
     #   0) 1:1 —— 正方形画布（旧行为，边长 = target_size 或长边向上取整到 32 的倍数）
     #   1) 16 的倍数 —— 保持比例，宽高各自向上取整到 16 的倍数，补边只在右/下
     #   2) 32 的倍数 —— 同上，但取 32 的倍数（与核心 TextEncodeQwenImage21 的取整一致）
+    #   3) 32 的倍数（四周留边）—— 四边各留 edge_margin 像素（32 的倍数）后再按 32 取整；
+    #      内容原点落在 (margin, margin)，仍是 32 的倍数 ⇒ 内容依旧严格对齐 latent 网格，
+    #      但给「自动对齐到参考图」的 crop 模式留出了向左/向上裁剪的余量。
+    #   4) 1:1（四周留边）—— 在档位 0 的正方形画布基础上，四边各再留 edge_margin 像素：
+    #      先把长边（画布边长）补齐到 32 的倍数，再加 2*margin 做成 1:1（内容居中）。
+    #
+    #      ⚠ 档位 3/4 才是「防偏移」的关键：crop 模式的对齐窗口起点 = 内容原点 + 位移。
+    #      纯右/下补边（档位 1/2）把内容原点钉在 (0,0)，窗口起点一为负就被 clamp 回 0 ——
+    #      **校正量被静默吃掉**。档位 0（1:1）在横图上同样贴边：画布宽 == 内容长边
+    #      ⇒ pad_left = pad_right = 0，横向一格余量都没有。只有画布在四边都留下
+    #      ≥ 漂移量的余量（档位 3/4）才校正得回来。
+    #
+    #      ⚠ 别把「1:1（四周留边）」误当成「长边多补一格 32」：长边本身已是 32 的倍数时，
+    #      「补齐到 32 的倍数 + 做成 1:1」这两步得到的画布与档位 0 **逐像素相同**
+    #      （768×715 → 768×768，横向仍是 0 余量），必须靠 edge_margin 额外留边才有余量。
     #
     # 关于「16」的硬约束：核心 TextEncodeQwenImage21 在 resolution=0 时按
     # round(dim/32)*32 计算 latent 尺寸，所以**画布宽高必须是 32 的倍数**，
     # 否则 latent 会和画布对不上（例如画布宽 1200 会被它算成 1216）。
     # 因此「16 的倍数」档位在核心编码节点下不可用，除非换成 16 对齐的文本编码。
     # 节点会在这种情况下打印明确警告。
-    PAD_MODES = ["1:1（方形画布）", "16 的倍数", "32 的倍数"]
-    PAD_SQUARE, PAD_16, PAD_32 = PAD_MODES
+    PAD_MODES = ["1:1（方形画布）", "16 的倍数", "32 的倍数", "32 的倍数（四周留边）",
+                 "1:1（四周留边）"]
+    PAD_SQUARE, PAD_16, PAD_32, PAD_MARGIN, PAD_SQUARE_MARGIN = PAD_MODES
 
     @classmethod
     def define_schema(cls):
@@ -155,7 +171,20 @@ class ResizeAndPadNode(io.ComfyNode):
                 io.Combo.Input("pad_mode", options=cls.PAD_MODES, default=cls.PAD_SQUARE,
                                display_name="画布模式",
                                tooltip="1:1 = 旧的正方形画布；16/32 的倍数 = 保持比例只补右/下，更省时间"
-                                       "（推荐 32：与核心文本编码节点的取整一致）"),
+                                       "（推荐 32：与核心文本编码节点的取整一致）；"
+                                       "⚠「32 的倍数」与贴边的「1:1」在左/上零余量，"
+                                       "微调模型往左漂时校正量会被夹掉，输出就保持原漂移；"
+                                       "只有「32 的倍数（四周留边）」和「1:1（四周留边）」"
+                                       "两档能真正把漂移校正回来"),
+                # 四周留边（仅「32 的倍数（四周留边）」档位生效）。
+                # 必须是 32 的倍数：内容原点 = margin，仍要落在 latent 网格上
+                # （16px = 1 格），否则本节点费劲保持的「内容原点对齐」就白做了。
+                # 默认 32 足够覆盖 Qwen 系 1~2 格的固有漂移；换成漂移更大的微调模型时调大。
+                io.Int.Input("edge_margin", default=32, min=0, max=512, step=32,
+                             display_name="四周留边（像素）",
+                             tooltip="「32 的倍数（四周留边）」与「1:1（四周留边）」两档生效；"
+                                     "建议 ≥ 模型的最大漂移量"
+                                     "（原版约 0~16px，微调版常见 16~32px，保险起见 32~64）"),
             ],
             outputs=[
                 io.Image.Output("output_image", display_name="输出图像"),
@@ -165,11 +194,25 @@ class ResizeAndPadNode(io.ComfyNode):
 
     @classmethod
     def execute(cls, input_image, target_size, resolution_multiple, upscale_method, resize_and_pad,
-                background_color="#000000", scale_mode="fill_target", pad_mode=None):
+                background_color="#000000", scale_mode="fill_target", pad_mode=None,
+                edge_margin=32):
         # pad_mode 缺省（旧工作流没这个控件）时按「1:1 方形画布」，行为与之前完全一致
         pad_mode = pad_mode or cls.PAD_SQUARE
         if pad_mode not in cls.PAD_MODES:
             pad_mode = cls.PAD_SQUARE
+
+        # 四周留边只在两档「四周留边」生效；吸附到 32 的倍数 —— 档位 3 的内容原点 = margin，
+        # 必须仍落在 latent 网格上（16px = 1 格），否则那一档就白做了；
+        # 档位 4 是居中，原点本就不在网格上（与旧 1:1 一致），留边吸附到整格仍便于对账。
+        margin = 0
+        if pad_mode in (cls.PAD_MARGIN, cls.PAD_SQUARE_MARGIN):
+            raw_margin = int(edge_margin or 0)
+            margin = max(0, int(round(raw_margin / 32.0)) * 32)
+            if margin != raw_margin:
+                print(
+                    "[调整图像尺寸填充] 四周留边 %d 已吸附为 %d（必须是 32 的倍数，"
+                    "否则内容原点会偏离 latent 网格）" % (raw_margin, margin)
+                )
 
         # bypass 模式：直接返回原图，image_info 中 canvas=1 防止下游除零
         if not resize_and_pad:
@@ -201,15 +244,17 @@ class ResizeAndPadNode(io.ComfyNode):
             "nearest": Image.Resampling.NEAREST,
         }[upscale_method]
 
-        aspect_mode = pad_mode != cls.PAD_SQUARE
-        multiple = 32 if pad_mode == cls.PAD_32 else 16
+        aspect_mode = pad_mode not in (cls.PAD_SQUARE, cls.PAD_SQUARE_MARGIN)
+        multiple = 32 if pad_mode in (cls.PAD_32, cls.PAD_MARGIN, cls.PAD_SQUARE_MARGIN) else 16
 
         # ---- 画布尺寸：只按第一张图决定（假设批次内尺寸一致）----
         first_w, first_h = pil_images[0].size
         if aspect_mode:
             cw, ch, _ = _content_size(first_w, first_h, target_size, scale_mode)
-            canvas_w = -(-cw // multiple) * multiple
-            canvas_h = -(-ch // multiple) * multiple
+            # 四周留边档位：画布 = ceil32(内容 + 2*margin)，内容原点落在 (margin, margin)，
+            # margin 是 32 的倍数 ⇒ 原点仍在 latent 网格上，且左右/上下都有裁剪余量
+            canvas_w = -(-(cw + 2 * margin) // multiple) * multiple
+            canvas_h = -(-(ch + 2 * margin) // multiple) * multiple
             if multiple == 16 and (canvas_w % 32 or canvas_h % 32):
                 print(
                     "[调整图像尺寸填充] 警告：画布 %dx%d 不是 32 的倍数，"
@@ -221,7 +266,18 @@ class ResizeAndPadNode(io.ComfyNode):
         else:
             if target_size <= 0:
                 target_size = -(-max(first_w, first_h) // 32) * 32
-            canvas_w = canvas_h = target_size
+            if pad_mode == cls.PAD_SQUARE_MARGIN:
+                # 先把长边（= 画布边长）补齐到 32 的倍数，再四边各留 margin，最后做成 1:1；
+                # 结果仍是 32 的倍数画布，但横向/纵向都出现 ≥ margin 的可裁剪余量 ——
+                # 这是让 「自动对齐到参考图」能修掉左右/上下漂移的前提。
+                canvas_side = -(-(target_size + 2 * margin) // 32) * 32
+                print(
+                    "[调整图像尺寸填充] 1:1（四周留边）：画布 %d×%d（内容 %d×%d，"
+                    "四边余量 ≥ %dpx）" % (canvas_side, canvas_side, first_w, first_h, margin)
+                )
+            else:
+                canvas_side = target_size
+            canvas_w = canvas_h = canvas_side
 
         processed_pil_images = []
         image_info_out = None
@@ -244,10 +300,12 @@ class ResizeAndPadNode(io.ComfyNode):
                 resized_image = pil_image.resize((new_width, new_height), resample=resampling_filter)
 
             if aspect_mode:
-                # 只在右/下补边：内容原点固定 (0,0)，严格落在 latent 网格上
-                pad_left = pad_top = 0
+                # 无留边（margin=0）：只在右/下补，内容原点固定 (0,0)，严格落在 latent 网格上；
+                # 有留边：四边各留 margin，原点 = (margin, margin)，margin 是 32 的倍数
+                # ⇒ 原点同样落在网格上，但左/上多出可裁剪余量（校正左/上漂移的前提）
+                pad_left = pad_top = margin
             else:
-                # 旧行为：居中
+                # 档位 0 与 4：居中（档位 4 的画布已含 2*margin，故四边余量 ≥ margin）
                 pad_left = (canvas_w - new_width) // 2
                 pad_top = (canvas_h - new_height) // 2
 
