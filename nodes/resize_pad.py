@@ -179,12 +179,19 @@ class ResizeAndPadNode(io.ComfyNode):
                 # 四周留边（仅「32 的倍数（四周留边）」档位生效）。
                 # 必须是 32 的倍数：内容原点 = margin，仍要落在 latent 网格上
                 # （16px = 1 格），否则本节点费劲保持的「内容原点对齐」就白做了。
-                # 默认 32 足够覆盖 Qwen 系 1~2 格的固有漂移；换成漂移更大的微调模型时调大。
-                io.Int.Input("edge_margin", default=32, min=0, max=512, step=32,
+                #
+                # ⚠ 关键语义：内容贴「左/上」放置（pad_left = pad_top = margin），
+                #   ceil32 产生的零头全部落在右/下。所以 —— 左/上余量**恰好等于**你填的值，
+                #   填 32 就只能向左/上校正 32px；右/下会稍多（margin + 零头）。
+                #   实测某微调模型在 964×1280 上向左漂 42px：填 32 时缺口 10px 无法校正，
+                #   输出就保持左偏 10px；填 64 才够。默认因此给 64。
+                io.Int.Input("edge_margin", default=64, min=0, max=512, step=32,
                              display_name="四周留边（像素）",
-                             tooltip="「32 的倍数（四周留边）」与「1:1（四周留边）」两档生效；"
-                                     "建议 ≥ 模型的最大漂移量"
-                                     "（原版约 0~16px，微调版常见 16~32px，保险起见 32~64）"),
+                             tooltip="「32 的倍数（四周留边）」与「1:1（四周留边）」两档生效。"
+                                     "留边 = 「自动对齐」在该方向能校正的最大像素数："
+                                     "内容贴左/上放置，故左/上余量恰好等于你填的值（填 32 只能修 32px），"
+                                     "右/下会稍多。建议 64（覆盖常见 16~48px 漂移）；"
+                                     "原版模型 32 够，微调版漂移更大时用 96"),
             ],
             outputs=[
                 io.Image.Output("output_image", display_name="输出图像"),
@@ -195,7 +202,7 @@ class ResizeAndPadNode(io.ComfyNode):
     @classmethod
     def execute(cls, input_image, target_size, resolution_multiple, upscale_method, resize_and_pad,
                 background_color="#000000", scale_mode="fill_target", pad_mode=None,
-                edge_margin=32):
+                edge_margin=64):
         # pad_mode 缺省（旧工作流没这个控件）时按「1:1 方形画布」，行为与之前完全一致
         pad_mode = pad_mode or cls.PAD_SQUARE
         if pad_mode not in cls.PAD_MODES:
@@ -326,6 +333,16 @@ class ResizeAndPadNode(io.ComfyNode):
                 pad_bottom = canvas_h - new_height - pad_top
                 # 6 元组：末尾两位是画布宽高（旧版是单一边长的 5 元组，下游已兼容两种）
                 image_info_out = (pad_left, pad_top, pad_right, pad_bottom, canvas_w, canvas_h)
+                # 把「四边余量 = 自动对齐能校正的最大漂移量」明确打出来：
+                # 留边档位是内容贴左/上放置 + ceil32 零头全落右/下，所以左/上余量 = 你填的
+                # edge_margin，而右/下会多出一截。不打印的话用户会误以为四周都一样宽。
+                print(
+                    "[调整图像尺寸填充] 画布 %dx%d，内容 %dx%d，四边余量 左%d 右%d 上%d 下%d"
+                    "（=「自动对齐到参考图」在各方向能校正的最大漂移量；漂移超出该方向余量时，"
+                    "超出的部分取不到画布外像素，会留在输出里）"
+                    % (canvas_w, canvas_h, new_width, new_height,
+                       pad_left, pad_right, pad_top, pad_bottom)
+                )
 
         return io.NodeOutput(pil_to_tensor(processed_pil_images), image_info_out)
 

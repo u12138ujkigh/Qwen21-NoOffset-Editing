@@ -173,8 +173,13 @@ def _crop_aligned(arr, dx, dy, win_h, win_w, origin):
     return arr[y0 : y0 + win_h, x0 : x0 + win_w], exact
 
 
-def _warn_insufficient_margin(dx, dy):
-    """crop 模式因留边不足而无法校正位移时，给出可直接照做的修复指引。"""
+def _warn_insufficient_margin(dx, dy, margins=None):
+    """crop 模式因留边不足而无法校正位移时，给出可直接照做的修复指引。
+
+    margins = (left, top, right, bottom)：内容区到画布四边的实际余量（来自 image_info）。
+    有它才能算出**缺口**和**该填多少** —— 只说「设为不小于 N」用户仍可能填回 32（N<64 时
+    最近的下取整恰好就是 32），于是再跑一次还是偏。所以这里必须给到具体数值。
+    """
     dirs = []
     if dx < 0:
         dirs.append("左")
@@ -185,13 +190,43 @@ def _warn_insufficient_margin(dx, dy):
     elif dy > 0:
         dirs.append("下")
     need = max(abs(dx), abs(dy))
+    suggest = -(-need // 32) * 32  # 32 的倍数，且 ≥ need
+
+    avail = None
+    if margins is not None:
+        left, top, right, bottom = margins
+        cand = []
+        if dx < 0:
+            cand.append(left)
+        elif dx > 0:
+            cand.append(right)
+        if dy < 0:
+            cand.append(top)
+        elif dy > 0:
+            cand.append(bottom)
+        if cand:
+            avail = min(cand)
+
+    if avail is None:
+        head = (
+            "[自动对齐到参考图] 校正量不足：模型把内容向 %s 推了 %dpx，"
+            "但画布在该方向没有余量（画布外取不到像素），这部分偏移只能留在输出里。"
+            % ("/".join(dirs) or "?", need)
+        )
+    else:
+        head = (
+            "[自动对齐到参考图] 校正量不足：模型把内容向 %s 推了 %dpx，"
+            "但画布在该方向只留了 %dpx 余量，差 %dpx 取不到（画布外没有像素），"
+            "这 %dpx 只能留在输出里 —— 输出仍会向 %s 偏 %dpx。"
+            % ("/".join(dirs) or "?", need, avail, need - avail, need - avail,
+               "/".join(dirs) or "?", need - avail)
+        )
     print(
-        "[自动对齐到参考图] 检测到内容向 %s 偏移 %dpx，但裁剪窗口被夹回画布边界，"
-        "**校正量已丢失** —— 这正是输出看起来仍然偏移的原因。\n"
-        "  修复：把「调整图像尺寸填充」的画布模式改成「32 的倍数（四周留边）」或"
-        "「1:1（四周留边）」，"
-        "并把「四周留边」设为不小于 %d（必须是 32 的倍数，32~64 一般够用）。"
-        % ("/".join(dirs) or "?", need, need)
+        head + "\n"
+        "  修复：留边就等于「自动对齐」在该方向能校正的最大像素数 —— 填 32 就只能修 32px。\n"
+        "  请把「调整图像尺寸填充」的画布模式选成「32 的倍数（四周留边）」（或「1:1（四周留边）」），"
+        "并把「四周留边」设成 32 的倍数且 ≥ %d，也就是填 %d。"
+        % (need, suggest)
     )
 
 
@@ -255,6 +290,7 @@ class AutoAlignToReferenceNode(io.ComfyNode):
         # 兼容旧 5 元组 (…, canvas) —— 那种情况两轴都取该值（方形画布）。
         origin = None
         win = None
+        margins = None
         if crop_to_reference and image_info is not None:
             parsed = _parse_image_info(image_info)
             if parsed is not None:
@@ -265,6 +301,9 @@ class AutoAlignToReferenceNode(io.ComfyNode):
                     if 0 < win_h <= arr.shape[1] and 0 < win_w <= arr.shape[2]:
                         origin = (top, left)
                         win = (win_h, win_w)
+                        # 四边实际余量：留边就是「自动对齐」在该方向能校正的最大像素数，
+                        # 告警要用它算缺口（只报「偏移了多少」用户不知道该把留边填多大）。
+                        margins = (left, top, right, bottom)
 
         if crop_to_reference and win is None:
             print(
@@ -298,7 +337,7 @@ class AutoAlignToReferenceNode(io.ComfyNode):
             if crop_to_reference and win is not None:
                 crop, exact = _crop_aligned(arr[i], dx, dy, win[0], win[1], origin)
                 if not exact:
-                    _warn_insufficient_margin(dx, dy)
+                    _warn_insufficient_margin(dx, dy, margins)
                 outs.append(crop)
             else:
                 outs.append(_shift(arr[i], dx, dy))
