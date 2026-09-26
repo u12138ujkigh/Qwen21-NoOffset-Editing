@@ -40,8 +40,9 @@ Scales the image proportionally and pads it onto a canvas, outputting `output_im
 | `resize_and_pad` | BOOLEAN | True | Off = bypass (pass-through) |
 | `background_color` | STRING | #000000 | Pad color; **`transparent`** = transparent padding (RGBA output) |
 | `scale_mode` | COMBO | fill_target | `fill_target` = scale to fit exactly; **`no_upscale`** = shrink only, never enlarge |
-| **`pad_mode`** | COMBO | 1:1 (square) | **Canvas mode**: `1:1（方形画布）` / `16 的倍数` / `32 的倍数` / `32 的倍数（四周留边）` / `1:1（四周留边）` |
-| **`edge_margin`** | INT | 64 | Margin per side, used by the two `四周留边` modes (0–512, step 32); snapped to a multiple of 32. **The left/top room is exactly the value you set** — the content is placed flush against the left/top edge and the ceil-to-32 slack all lands on the right/bottom, so this value is also the maximum drift the aligner can correct on the left/top axes |
+| **`pad_mode`** | COMBO | 1:1 (square) | **Canvas mode**: `1:1（方形画布）` / `16 的倍数` / `32 的倍数` / `32 的倍数（四周留边）` / `1:1（四周留边）` / `32 的倍数（四边自定义）` |
+| **`edge_margin`** | INT | 64 | Margin per side, used by the two `四周留边` modes (0–512, **step 8**). **The left/top room is exactly the value you set** — the content is placed flush against the left/top edge and the ceil-to-32 slack all lands on the right/bottom, so this value is also the maximum drift the aligner can correct on the left/top axes |
+| **`margin_left` / `margin_top` / `margin_right` / `margin_bottom`** | INT | 0 | Per-side margins (px, step 8), used by `32 的倍数（四边自定义）` only. **Pad only the sides your model actually drifts towards** — the same canvas area buys a larger margin on that side |
 
 **Canvas modes**
 
@@ -52,18 +53,35 @@ Scales the image proportionally and pads it onto a canvas, outputting `output_im
 | `32 的倍数` | Same, multiple of 32 | **right/bottom only** | Smaller area; **zero left/top room**, so left/up drift cannot be corrected |
 | `32 的倍数（四周留边）` | Aspect preserved, `edge_margin` on all four sides, then rounded up to a multiple of 32 | **left/top = your value, right/bottom = your value + slack** | **Recommended for the no-offset pipeline**: content origin stays on the latent grid *and* every direction has room to correct drift |
 | `1:1（四周留边）` | Square, side = long side rounded up to a multiple of 32 **plus 2 × `edge_margin`** | **all four sides ≥ your value** | Same drift protection while keeping a (larger) square canvas: 983×1280 → 1344² vs 1056×1344 for the aspect mode |
+| `32 的倍数（四边自定义）` | Aspect preserved, canvas = `ceil32(w + left + right) × ceil32(h + top + bottom)`, content placed at `(left, top)` | **left/top = your value; right/bottom = your value + slack** | **Cheapest**: specify each side separately and pad only where the model actually drifts. E.g. 964×1280 with left 64 / top 32 / right 0 / bottom 0 → canvas 1056×**1312**, which is **2.4% smaller** than "32 on all four sides" (1056×1344) yet gives **64** px of left room; measured zero-shift NCC = **1.0000** |
+
+> 🔎 **The margin granularity is 8 px, not a multiple of 32.**
+> The implementation is literally the two steps you'd expect — "grow the content by the margin you
+> typed, then round the canvas up to a multiple of 32" — so the canvas is always a multiple of 32
+> (required by the core encoder) while **the margin itself is free**
+> (older builds silently snapped 40 down to 32, throwing away 8 px of room).
+>
+> Evidence: a real-VAE encode→decode round trip (no sampling) over margins 1–64 at every phase
+> shows a content drift of exactly **(0,0)** and a constant content MAE of 0.74/255
+> (`_gate/verify_margin_granularity.py`; full-resolution re-run over the multiples of 8:
+> NCC 0.99986, drift all zero). So an origin that is *not* on the 16/32 grid does **not** make the
+> VAE drift by itself. The latent spatial compression is 16, i.e. 8 px = half a latent cell.
 
 > ✅ **Use `32 的倍数（四周留边）` with a margin of 64.** The margin *is* the maximum drift the aligner
 > can correct on that axis: **the left/top room equals exactly the value you set**, so a margin of 32 can
 > only correct 32 px (the right/bottom sides get a little extra from the ceil-to-32 slack — never rely on
 > it). A fine-tuned Qwen 2.1 shifting **42 px left** on a 964×1280 image leaves a 10 px gap at a margin
 > of 32 (measured residual **10 px left**) and drops to **0** at 64. Use 96 for models that drift further.
-> If you specifically need a square canvas, use `1:1（四周留边）` with the same margin. The bundled
-> workflow already ships with this configuration.
+> If you specifically need a square canvas, use `1:1（四周留边）` with the same margin.
+> **To save area**, use `32 的倍数（四边自定义）` when the drift direction is fixed (here: always left):
+> pad only left 64 / top 32 and leave right/bottom at 0 — the canvas becomes 1056×**1312**, **2.4% smaller**
+> than "32 on all four sides" (1056×1344), yet the left room is 64; measured zero-shift NCC = **1.0000**.
+> The trade-off is zero correction room on the right/bottom — pad those too if your model drifts that way.
+> The bundled workflow already ships with `32 的倍数（四周留边）` + 64.
 
 Benefits of the aspect modes:
 1. **Faster** — no more squaring; a landscape image saves ~37% of latent tokens (2752×1536 goes from 2752² to 2880×1664), a portrait one 30–45% (1200×1746 goes from 1760² to 1216×1760);
-2. **Content origin lands on the latent grid** — with `right/bottom only` the content stays pinned at `(0,0)`; the `四周留边` mode puts it at `(margin, margin)` with `margin` a multiple of 32, which is still on the grid. The legacy `1:1` mode **centers** the content, so the origin can land off-grid (e.g. 1200×1746 in a 1760 square gives `pad_left = 280`, and 280 % 32 = 24).
+2. **Content origin is unambiguous** — with `right/bottom only` the content stays pinned at `(0,0)`; the `四周留边` modes place it at `(margin, margin)`. Margins are snapped to 8 px, and a real-VAE round trip shows no measurable drift at any phase (see above), so an off-grid origin is fine.
 
 > ⚠️ **Why `32 的倍数（四周留边）` is the recommended canvas mode.** Crop mode corrects drift by
 > starting its window at `origin + shift`. With right/bottom-only padding `origin = (0,0)`, so a left/up
