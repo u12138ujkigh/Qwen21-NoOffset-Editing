@@ -9,6 +9,9 @@ from comfy_api.latest import ComfyExtension, io
 
 from .nodes import ResizeAndPadNode, RemovePadFromImageNode, AutoAlignToReferenceNode
 
+# 前端扩展：让「调整图像尺寸填充」的留边控件跟着「画布模式」启用/置灰。
+WEB_DIRECTORY = "./web"
+
 
 class NoOffsetEditingExtension(ComfyExtension):
     @override
@@ -24,4 +27,4 @@ async def comfy_entrypoint() -> NoOffsetEditingExtension:
     return NoOffsetEditingExtension()
 
 
-__all__ = ["comfy_entrypoint"]
+__all__ = ["WEB_DIRECTORY", "comfy_entrypoint"]

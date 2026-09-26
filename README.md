@@ -55,6 +55,19 @@ Scales the image proportionally and pads it onto a canvas, outputting `output_im
 | `1:1（四周留边）` | Square, side = long side rounded up to a multiple of 32 **plus 2 × `edge_margin`** | **all four sides ≥ your value** | Same drift protection while keeping a (larger) square canvas: 983×1280 → 1344² vs 1056×1344 for the aspect mode |
 | `32 的倍数（四边自定义）` | Aspect preserved, canvas = `ceil32(w + left + right) × ceil32(h + top + bottom)`, content placed at `(left, top)` | **left/top = your value; right/bottom = your value + slack** | **Cheapest**: specify each side separately and pad only where the model actually drifts. E.g. 964×1280 with left 64 / top 32 / right 0 / bottom 0 → canvas 1056×**1312**, which is **2.4% smaller** than "32 on all four sides" (1056×1344) yet gives **64** px of left room; measured zero-shift NCC = **1.0000** |
 
+**Widget linking**: once a canvas mode is picked, the margin widgets that mode does not use are
+**greyed out and locked** — you cannot change them by accident, and it is obvious which one to edit.
+
+| Canvas mode | `edge_margin` | `margin_left / top / right / bottom` |
+| --- | --- | --- |
+| `1:1（方形画布）` / `16 的倍数` / `32 的倍数` | greyed | greyed |
+| `32 的倍数（四周留边）` / `1:1（四周留边）` | **editable** | greyed |
+| `32 的倍数（四边自定义）` | greyed | **editable** |
+
+With "启用尺寸填充" (Resize and pad) turned off the node bypasses everything, so all four margin
+widgets are greyed out as well. This is purely a UI behaviour: the values are still stored, so
+switching back to the matching mode restores them and existing workflows keep their numbers.
+
 > 🔎 **The margin granularity is 8 px, not a multiple of 32.**
 > The implementation is literally the two steps you'd expect — "grow the content by the margin you
 > typed, then round the canvas up to a multiple of 32" — so the canvas is always a multiple of 32
