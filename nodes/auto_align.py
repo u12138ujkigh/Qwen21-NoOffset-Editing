@@ -84,14 +84,36 @@ def _round32(v):
     return int(round(int(v) / 32)) * 32
 
 
-def _diagnose_domain_mismatch(iw, ih, rw, rh, crop_to_reference):
-    """两路尺寸不一致时，追加一段「可能的错位来源」提示，便于用户自查接线。"""
+def _diagnose_domain_mismatch(iw, ih, rw, rh, crop_to_reference, info=None):
+    """两路尺寸不一致时，追加一段「可能的错位来源」提示，便于用户自查接线。
+
+    info = 「调整图像尺寸填充」的填充元数据（已解析为六元组），有它才能做最要命的那条
+    判定：**解码输出其实是「未填充的原图」域** —— 用户把 TextEncodeQwenImage21 的
+    image_1 接成了原图（不是填充后的画布）。此时补边只送进了本节点，
+    模型从头到尾没见过补边，latent/解码都在原图尺寸域里，必然对不上。
+    """
     tips = []
+    # 情形零：解码输出 = 原图内容区按 32 四舍五入（TextEncodeQwenImage21 建 latent 的规则），
+    # 而参考图 = 填充后的画布 —— 接线错误的铁证，优先给出（其余泛泛提示都不如这条准）
+    if info is not None:
+        left, top, right, bottom, cw, ch = info
+        win_w, win_h = cw - left - right, ch - top - bottom
+        if (cw, ch) == (rw, rh) and win_w > 0 and win_h > 0:
+            cand = {(_round32(win_w), _round32(win_h)), (_round32(win_h), _round32(win_w))}
+            if (iw, ih) in cand:
+                tips.append(
+                    f"解码输出 {iw}x{ih} 恰好等于「内容区 {win_w}x{win_h} 按 32 四舍五入」的尺寸，"
+                    f"而参考图 {rw}x{rh} 是填充后的画布 —— 说明「TextEncodeQwenImage21」的 image_1 "
+                    "接的是**未填充的原图**：它按原图尺寸建 latent，模型整条去噪链路没见过补边，"
+                    "补边只送到了本节点的 reference_image，两路必然不同域。\n"
+                    "  修复：把「TextEncodeQwenImage21」的 image_1 改接"
+                    "「调整图像尺寸填充」的「输出图像」（同一个 padded 域）。"
+                )
     il, rl = max(iw, ih), max(rw, rh)
     same_min = abs(min(iw, ih) - min(rw, rh)) <= 32
     # 情形一：两路是同一张图，只是 32 对齐的取整规则不同（长边差 ≤ 32）
     # —— 这是最常见的「假错位」，两路其实同图，只是一个做了 32 上取整 / 四舍五入
-    if same_min and 0 < abs(il - rl) <= 32:
+    if not tips and same_min and 0 < abs(il - rl) <= 32:
         lo, hi = min(il, rl), max(il, rl)
         rule = None
         if _ceil32(lo) == hi:
@@ -110,7 +132,7 @@ def _diagnose_domain_mismatch(iw, ih, rw, rh, crop_to_reference):
                 "请检查两路是否走了不同的缩放/填充节点。"
             )
     # 情形二：两路长边差异较大，说明来自不同的输入图
-    elif abs(il - rl) > 32:
+    elif not tips and abs(il - rl) > 32:
         tips.append(
             f"两路长边差距较大（image {il} vs reference {rl}），"
             "通常意味着它们来自不同的输入图 —— "
@@ -279,11 +301,14 @@ class AutoAlignToReferenceNode(io.ComfyNode):
         img_frames = _to_gray(image)
         arr = image.detach().cpu().numpy()
 
+        # 填充元数据先解析：尺寸不一致时也要用它判定「两路各自在哪个域」
+        info = _parse_image_info(image_info) if image_info is not None else None
+
         if ref.shape != img_frames[0].shape:
             ih, iw = img_frames[0].shape
             rh, rw = ref.shape
             # 常见的「尺寸域错位」诊断：看两路是否只是 32 倍数取整的差异
-            hint = _diagnose_domain_mismatch(iw, ih, rw, rh, crop_to_reference)
+            hint = _diagnose_domain_mismatch(iw, ih, rw, rh, crop_to_reference, info)
             raise ValueError(
                 f"自动对齐到参考图：image {iw}x{ih} 与 "
                 f"reference_image {rw}x{rh} 尺寸不一致。"
@@ -299,7 +324,7 @@ class AutoAlignToReferenceNode(io.ComfyNode):
         win = None
         margins = None
         if crop_to_reference and image_info is not None:
-            parsed = _parse_image_info(image_info)
+            parsed = info   # 上面已解析（尺寸校验也要用，故不重复解析）
             if parsed is not None:
                 left, top, right, bottom, canvas_w, canvas_h = parsed
                 if canvas_w > 1 and canvas_h > 1 and right >= 0 and bottom >= 0:
