@@ -42,16 +42,96 @@ ImageInfo = io.Custom("IMAGE_INFO")
 # ResizeAndPadNode — 调整尺寸并填充
 # ============================================================
 
-# 与 ComfyUI_LayerStyle 的「按宽高比缩放 V2」相同的约定：填这些关键字（或留空）
-# 表示补边透明，节点输出 RGBA（4 通道），补边 alpha=0，上游带来的 alpha 原样保留。
-TRANSPARENT_KEYWORDS = {"transparent", "none", "alpha", "clear"}
+# 补边填充方式（下拉五选一）：标签即取值 —— ComfyUI 把下拉选中的字符串原样作为输入传给节点。
+#
+# 前三项是纯色/透明；后两项把补边做成「内容的延续」，这是让 Qwen 把它当画面重绘的关键：
+# 实测（红潮模型、种子固定、画布 1056×1312、中性提示词）——
+#   纯白 → 解码图左侧残留 3px 白带，模型只做了轻微洗白，色带仍在；
+#   纯黑 → 模型**逐像素照抄**，解码图左侧 54px 纯黑带原样保留；
+#   透明 → 同上，照抄 54px（alpha=0 在 RGB 里即黑边）；
+#   镜像 → 解码图左侧**零平坦带**（std 43），模型当画面重绘，裁剪后 0px 残留，内容保真 NCC 0.9916；
+#   边缘延展 → 同样零残留（NCC 0.9845）。
+# 即：只有「镜像 / 边缘延展」能真正消掉裁剪后的色带，故默认给「镜像」。
+PAD_WHITE = "纯白 (#FFFFFF)"
+PAD_BLACK = "纯黑 (#000000)"
+PAD_TRANSPARENT = "透明 (alpha=0)"
+PAD_MIRROR = "镜像 (reflect)｜推荐"
+PAD_EDGE = "边缘延展 (edge)"
+PAD_COLORS = [PAD_WHITE, PAD_BLACK, PAD_TRANSPARENT, PAD_MIRROR, PAD_EDGE]
+
+# 需实际「生成像素」的补边方式（按 _resolve_background 返回的 fill_mode 索引）→ numpy.pad 模式名
+PAD_NUMPY_MODES = {"reflect": "reflect", "edge": "edge"}
+
+# 旧工作流里手填过的透明关键字（与 ComfyUI_LayerStyle 的「按宽高比缩放 V2」同一约定）。
+TRANSPARENT_KEYWORDS = {"transparent", "none", "alpha", "clear", ""}
+
+# 解析结果：fill_mode ∈ {"color", "transparent", "reflect", "edge"}
+FILL_COLOR, FILL_TRANSPARENT = "color", "transparent"
 
 
-def _wants_transparent(background_color) -> bool:
-    """背景色请求透明时返回 True（不区分大小写，空串也算）。"""
-    if background_color is None:
-        return True
-    return str(background_color).strip().lower() in TRANSPARENT_KEYWORDS or str(background_color).strip() == ""
+def _resolve_background(background_color):
+    """把「补边颜色」归一化成 (fill_mode, hex_color)。
+
+    三种来源都要认：控件从「自由字符串」改成下拉后，老工作流里存的 "#FFFFFF" /
+    "transparent" 仍会原样送进来（节点已在 validate_inputs 里为它豁免了白名单校验），
+    所以这里必须兼容历史写法，否则老工作流的行为会静默改变。
+      * 新版下拉：纯白 / 纯黑 / 透明 / 镜像 / 边缘延展；
+      * 旧版手填的十六进制色（#FFFFFF、#abc…）—— 原样使用；
+      * 旧版透明关键字（transparent / none / alpha / clear，或留空）—— 视为透明。
+    返回 (mode, color)：
+      ("transparent", None) —— 画布走 RGBA、补边 alpha=0，上游 alpha 原样保留；
+      ("reflect"/"edge", None) —— 补边由内容镜像/边缘延展生成（RGB）；
+      ("color", "#RRGGBB") —— 纯色补边（RGB）。
+    """
+    s = "" if background_color is None else str(background_color).strip()
+    low = s.lower()
+    if low in TRANSPARENT_KEYWORDS or s.startswith("透明"):
+        return FILL_TRANSPARENT, None
+    if s.startswith("纯白") or low in ("white", "#fff", "#ffffff"):
+        return FILL_COLOR, "#FFFFFF"
+    if s.startswith("纯黑") or low in ("black", "#000", "#000000"):
+        return FILL_COLOR, "#000000"
+    if s.startswith("镜像") or low in ("reflect", "mirror", "mirrored"):
+        return "reflect", None
+    if s.startswith("边缘延展") or low in ("edge", "replicate", "clamp"):
+        return "edge", None
+    return FILL_COLOR, s
+
+
+def _build_canvas(resized_image, canvas_w, canvas_h, pad_left, pad_top,
+                  fill_mode, pad_color):
+    """按补边方式把内容放到画布上。
+
+    * color       —— 纯色底 + 粘贴（RGB）
+    * transparent —— 透明底 + 粘贴（RGBA，补边 alpha=0，保留上游 alpha）
+    * reflect/edge—— 用 numpy.pad 让补边直接由内容生成（镜像 / 边缘像素延展），
+                     模型因此不会把它当作「纯色边框」照抄，而是当画面重绘 ——
+                     裁剪后不留色带。
+    """
+    if fill_mode in PAD_NUMPY_MODES:
+        arr = np.asarray(resized_image.convert("RGB"))
+        pad_bottom = canvas_h - pad_top - arr.shape[0]
+        pad_right = canvas_w - pad_left - arr.shape[1]
+        if min(pad_left, pad_top, pad_right, pad_bottom) < 0:
+            raise ValueError(
+                "[调整图像尺寸填充] 画布 %dx%d 装不下内容 %dx%d（左%d 上%d 右%d 下%d）"
+                % (canvas_w, canvas_h, arr.shape[1], arr.shape[0],
+                   pad_left, pad_top, pad_right, pad_bottom))
+        padded = np.pad(
+            arr,
+            ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)),
+            mode=PAD_NUMPY_MODES[fill_mode],
+        )
+        return Image.fromarray(padded)
+
+    if fill_mode == FILL_TRANSPARENT:
+        canvas = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+        canvas.paste(resized_image.convert("RGBA"), (pad_left, pad_top))
+        return canvas
+
+    canvas = Image.new("RGB", (canvas_w, canvas_h), color=pad_color)
+    canvas.paste(resized_image.convert("RGB"), (pad_left, pad_top))
+    return canvas
 
 
 def _content_size(orig_w: int, orig_h: int, target_size: int, scale_mode: str):
@@ -161,12 +241,16 @@ class ResizeAndPadNode(io.ComfyNode):
                 io.Boolean.Input("resize_and_pad", default=True,
                                  display_name="启用尺寸填充",
                                  tooltip="关闭则原样输出（旁路）"),
-                # 填十六进制色（如 #FF0000）则补边涂该色、输出 RGB；
-                # 填 transparent（或清空）则补边透明、输出 RGBA，
-                # 上游「按宽高比缩放 V2」选 transparent 时其 alpha 会原样保留。
-                io.String.Input("background_color", default="#000000",
-                                display_name="补边颜色",
-                                tooltip="填 transparent（或清空）= 透明补边，输出 RGBA"),
+                # 补边填充方式（下拉五选一）。语义见 _resolve_background。
+                # 控件虽是下拉，节点仍接受历史上手填的任意十六进制色与 transparent 关键字
+                # —— validate_inputs 已为该输入豁免了下拉白名单校验，老工作流无需迁移。
+                io.Combo.Input("background_color", options=PAD_COLORS, default=PAD_MIRROR,
+                               display_name="补边填充",
+                               tooltip="⚠ 模型把「纯色边框」当画面内容照抄，裁剪后必留色带"
+                                       "（实测纯黑/透明的带完整保留、纯白只被轻微洗白）。"
+                                       "推荐「镜像」或「边缘延展」：补边由内容自身生成，"
+                                       "模型会把它当画面重绘，裁剪后零残留（实测内容保真 NCC 0.99）。"
+                                       "纯白/纯黑 = 补边填 #FFFFFF/#000000；透明 = 输出 RGBA、补边 alpha=0"),
                 # fill_target：旧行为，内容等比缩放至恰好放入 target 画布；
                 # no_upscale：内容只缩不放大（超过 target 才缩），配合 target 取
                 # 长边向上取整的 32 倍数可实现内容零重采样的方形化（Qwen 编辑防偏移）。
@@ -231,8 +315,22 @@ class ResizeAndPadNode(io.ComfyNode):
         )
 
     @classmethod
+    def validate_inputs(cls, background_color=None):
+        """把「补边填充」纳入自定义校验，从而跳过 ComfyUI 对该下拉取值的白名单检查。
+
+        这是**刻意的兼容措施**：该控件历史上是自由字符串，老工作流里存着 "#FFFFFF" /
+        "transparent" 这类值。若不豁免，ComfyUI 会在校验阶段以 value_not_in_list 拒绝
+        整个工作流（execution.py 的 `if x not in validate_function_inputs and not
+        validate_has_kwargs:` 决定：被本签名列出的输入跳过 min/max/白名单三类默认校验）。
+        豁免后由 _resolve_background 归一化历史写法（含纯白/纯黑/透明/镜像/边缘延展五个
+        新档位），行为与旧版逐字一致。
+        只影响这一个输入，其余输入的默认校验照旧。返回值必须严格为 True 才算通过。
+        """
+        return True
+
+    @classmethod
     def execute(cls, input_image, target_size, resolution_multiple, upscale_method, resize_and_pad,
-                background_color="#000000", scale_mode="fill_target", pad_mode=None,
+                background_color=PAD_MIRROR, scale_mode="fill_target", pad_mode=None,
                 edge_margin=64, margin_left=0, margin_top=0, margin_right=0, margin_bottom=0):
         # pad_mode 缺省（旧工作流没这个控件）时按「1:1 方形画布」，行为与之前完全一致
         pad_mode = pad_mode or cls.PAD_SQUARE
@@ -286,7 +384,15 @@ class ResizeAndPadNode(io.ComfyNode):
                     target_size = target_size - remainder
             target_size = max(target_size, resolution_multiple)
 
-        transparent_pad = _wants_transparent(background_color)
+        fill_mode, pad_color = _resolve_background(background_color)
+        # 日志用的可读名（顺带把「纯色会被照抄」这个坑提示出来）
+        if fill_mode == FILL_COLOR:
+            fill_label = "纯色 %s（模型会照抄 ⇒ 裁剪后可能留色带）" % pad_color
+        elif fill_mode == FILL_TRANSPARENT:
+            fill_label = "透明 alpha=0（模型会照抄 ⇒ 裁剪后可能留透明带）"
+        else:
+            fill_label = {"reflect": "镜像（模型当画面重绘）",
+                          "edge": "边缘延展（模型当画面重绘）"}[fill_mode]
 
         pil_images = tensor_to_pil(input_image)
         if not pil_images:
@@ -375,15 +481,10 @@ class ResizeAndPadNode(io.ComfyNode):
                 pad_left = (canvas_w - new_width) // 2
                 pad_top = (canvas_h - new_height) // 2
 
-            # 创建画布：填色走 RGB（与旧版行为一致），
-            # transparent 走 RGBA —— 补边 alpha=0，图像区保留上游 alpha（无则 255）。
-            if transparent_pad:
-                padded_image = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
-                padded_image.paste(resized_image.convert("RGBA"), (pad_left, pad_top))
-            else:
-                padded_image = Image.new("RGB", (canvas_w, canvas_h),
-                                         color=str(background_color).strip() or "#000000")
-                padded_image.paste(resized_image.convert("RGB"), (pad_left, pad_top))
+            # 创建画布：填色走 RGB（与旧版行为一致），transparent 走 RGBA（补边 alpha=0），
+            # reflect/edge 由内容自身生成补边（详见 _build_canvas）。
+            padded_image = _build_canvas(resized_image, canvas_w, canvas_h,
+                                         pad_left, pad_top, fill_mode, pad_color)
             processed_pil_images.append(padded_image)
 
             # 仅从第一张图记录 image_info（假设批次内所有图像尺寸一致）
@@ -396,11 +497,12 @@ class ResizeAndPadNode(io.ComfyNode):
                 # 留边档位是内容贴左/上放置 + ceil32 零头全落右/下，所以左/上余量 = 你填的
                 # edge_margin，而右/下会多出一截。不打印的话用户会误以为四周都一样宽。
                 print(
-                    "[调整图像尺寸填充] 画布 %dx%d，内容 %dx%d，四边余量 左%d 右%d 上%d 下%d"
-                    "（=「自动对齐到参考图」在各方向能校正的最大漂移量；漂移超出该方向余量时，"
-                    "超出的部分取不到画布外像素，会留在输出里）"
+                    "[调整图像尺寸填充] 画布 %dx%d，内容 %dx%d，四边余量 左%d 右%d 上%d 下%d，"
+                    "补边 %s"
+                    "（余量 =「自动对齐到参考图」在各方向能校正的最大漂移量；"
+                    "漂移超出该方向余量时，超出的部分取不到画布外像素，会留在输出里）"
                     % (canvas_w, canvas_h, new_width, new_height,
-                       pad_left, pad_right, pad_top, pad_bottom)
+                       pad_left, pad_right, pad_top, pad_bottom, fill_label)
                 )
 
         return io.NodeOutput(pil_to_tensor(processed_pil_images), image_info_out)

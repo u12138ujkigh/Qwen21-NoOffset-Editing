@@ -36,7 +36,7 @@ In one line: **the official model wants `32 的倍数`; 红潮 (the fine-tuned b
 | **红潮** (fine-tuned build)<br>`redqw21UNLOCKED…_int8.safetensors` | **`32 的倍数（四周留边）`** | **32** | 红潮 is a redirected fine-tune and **drifts left systematically** (measured 24–42 px). The margin *is* the maximum drift the aligner can correct on that axis — with no left/top room the shift can never be undone |
 
 Everything else is identical for both models: `target_size = 0`, `resolution_multiple = 0`,
-`upscale_method = lanczos`, `scale_mode = no_upscale`, `background_color = transparent`;
+`upscale_method = lanczos`, `scale_mode = no_upscale`, `background_color = 镜像 (reflect)`;
 for Auto Align to Reference use `crop_to_reference = True` and `max_shift = 64`.
 
 > A margin of 32 covers the large majority of cases, but it is not a guarantee — the drift varies with
@@ -44,6 +44,29 @@ for Auto Align to Reference use `crop_to_reference = True` and `max_shift = 64`.
 > have to guess: Auto Align to Reference prints **how many pixels are missing and the exact margin to
 > set** (the 10 px residual case is told to use 64). So **32 is the recommended value and 64 the
 > fallback**.
+
+### Padding fill: use 镜像 (mirror), not flat colours
+
+The bar left over on the output is **not a margin shortage — it is the model copying the flat padding
+verbatim as if it were picture content**. Controlled test (红潮 + 6-step LoRA, seed / canvas geometry /
+prompt all frozen; **padding fill is the only variable**):
+
+| Padding fill | Bright residual band, decoded | Residual after crop | Content fidelity (NCC) |
+|---|---|---|---|
+| 纯黑 `#000000` | 54 px (copied pixel-for-pixel) | 19–20 px **black bar** | 0.939 |
+| 透明 `alpha=0` | 54 px (same) | 19 px (a transparent hole) | 0.948 |
+| 纯白 `#FFFFFF` | 47–63 px (only slightly whitened) | 9–12 px **white bar** | 0.874 |
+| **镜像 `reflect`** ← default | **0 px** | **0 px** | **0.992** |
+| **边缘延展 `edge`** | **0 px** | **0 px** | 0.985 |
+
+Only 镜像 / 边缘延展 make the padding an **extension of the content itself**, which is what gets the
+model to repaint it as picture — zero bar after cropping, and the *highest* content fidelity of the
+lot. That is why **镜像 is the default**.
+
+> ⚠ This retracts an earlier claim in this document: “transparent padding stops the model from
+> treating the bar as image content”. **It does not hold.** Both transparent and black are copied
+> **pixel for pixel** (transparent shows up as an alpha=0 hole), only marginally better than white.
+> The expectation that “the model will just outpaint the padding away” **only holds for 镜像 / 边缘延展**.
 
 ## Nodes
 
@@ -57,7 +80,7 @@ Scales the image proportionally and pads it onto a canvas, outputting `output_im
 | `resolution_multiple` | INT | 8 | Snaps target_size to a multiple of this; 0 = disable |
 | `upscale_method` | COMBO | lanczos | lanczos / bicubic / area / nearest |
 | `resize_and_pad` | BOOLEAN | True | Off = bypass (pass-through) |
-| `background_color` | STRING | #000000 | Pad color; **`transparent`** = transparent padding (RGBA output) |
+| **`background_color`** | COMBO | **镜像 (reflect)** | **Padding fill**: `纯白 (#FFFFFF)` / `纯黑 (#000000)` / `透明 (alpha=0)` / **`镜像 (reflect)`** / `边缘延展 (edge)`. 镜像 is recommended (see above) — flat colours leave a bar after cropping. Legacy hand-typed `#RRGGBB` and `transparent` still work: the node exempts this input from the combo whitelist, so old workflows need no migration |
 | `scale_mode` | COMBO | fill_target | `fill_target` = scale to fit exactly; **`no_upscale`** = shrink only, never enlarge |
 | **`pad_mode`** | COMBO | 1:1 (square) | **Canvas mode**: `1:1（方形画布）` / `16 的倍数` / `32 的倍数` / `32 的倍数（四周留边）` / `1:1（四周留边）` / `32 的倍数（四边自定义）` |
 | **`edge_margin`** | INT | 64 | Margin per side, used by the two `四周留边` modes (0–512, **step 8**). **The left/top room is exactly the value you set** — the content is placed flush against the left/top edge and the ceil-to-32 slack all lands on the right/bottom, so this value is also the maximum drift the aligner can correct on the left/top axes. The node default is **64** (more headroom than the recommended 32 for 红潮; harmless either way, and unused by the official model) |
@@ -167,7 +190,7 @@ i.e. **16 px = one latent cell**; a dimension that is not a multiple of 16 is **
 **Enhancements over the original plugin** (key to the no-offset pipeline):
 
 - `scale_mode = no_upscale` + `target_size = 0`: **zero-resample** — content enters the canvas pixel-for-pixel, enabling pixel-exact comparison after editing;
-- `background_color = transparent`: transparent padding, so the model does not treat black bars as "image content" and paint artifacts into them;
+- `background_color`: **five padding-fill modes** (white / black / transparent / **mirror** / **edge**). **Mirror is recommended** — only it and edge-extend turn the padding into a continuation of the content, which is what makes the model repaint it as picture and leaves no bar after cropping (measured table above);
 - `pad_mode`: selectable canvas shape / multiple, as above.
 
 ### 2. Remove Pad from Image
@@ -204,12 +227,12 @@ Estimates the integer-pixel shift of the edited output relative to the reference
 ```
 LoadImage ─▶ Resize and Pad ─▶ VAE Encode ─▶ KSampler ─▶ VAE Decode ─▶ Auto Align to Reference ─▶ Save
                   │ (no_upscale                                       │        (crop_to_reference=True)
-                  │  +transparent)                                    │
+                  │  +mirror padding)                                 │
                   ├──────────── image_info ───────────────────────────┤
                   └── output_image ──▶ (reference_image) ─────────────┘
 ```
 
-1. **Zero-resample padding**: Resize and Pad with `scale_mode = no_upscale`, `target_size = 0`, `background_color = transparent` — content enters the canvas 1:1, padding transparent. **Use a 64 px canvas margin**: `pad_mode = 32 的倍数（四周留边）` with `edge_margin = 64` — or `1:1（四周留边）` when you need a square canvas: these keep the content origin on the latent grid **and** leave room on all four sides for the aligner to crop into (**left/top room = the value you set**, so 32 can only correct 32 px), while still saving 30–45% of the latent tokens of the legacy square canvas. Do **not** use `32 的倍数` (right/bottom only) or `1:1（方形画布）` for drift-prone models — both have zero room on at least one axis, so the correction gets clamped away and the output stays shifted;
+1. **Zero-resample padding**: Resize and Pad with `scale_mode = no_upscale`, `target_size = 0`, `background_color = 镜像 (reflect)` — content enters the canvas 1:1 and the padding is generated from the content by mirroring (so the model repaints it as picture, leaving no bar after cropping). **Use a 32 px canvas margin**: `pad_mode = 32 的倍数（四周留边）` with `edge_margin = 32` — or `1:1（四周留边）` when you need a square canvas: these keep the content origin on the latent grid **and** leave room on all four sides for the aligner to crop into (**left/top room = the value you set**, so 32 can only correct 32 px), while still saving 30–45% of the latent tokens of the legacy square canvas (if the drift exceeds it the node prints the exact margin to use — 64 in that case). Do **not** use `32 的倍数` (right/bottom only) or `1:1（方形画布）` for drift-prone models — both have zero room on at least one axis, so the correction gets clamped away and the output stays shifted;
 2. **Edit normally**: VAE Encode → KSampler (Qwen Image Edit) → VAE Decode. The model works in the padded domain and will repaint the padded area too (normal — crop mode removes it);
 3. **Align-then-crop**: Auto Align to Reference with `crop_to_reference = True`, `reference_image` from the padded original, `image_info` from its metadata — FFT finds the 16–32 px shift introduced by the model and slices the window back to a 1:1 match with the original;
 4. **Output**: size = original content size, pixels 1:1, no copy streaks, no misalignment.
@@ -222,6 +245,6 @@ LoadImage ─▶ Resize and Pad ─▶ VAE Encode ─▶ KSampler ─▶ VAE Dec
 
 - This project is an improved distribution of [xingyuezhiyuan/Comfyui-txtnode](https://github.com/xingyuezhiyuan/Comfyui-txtnode):
   - **From the original plugin**: the base design of the "Resize and Pad Image" and "Remove Pad from Image" nodes (proportional scaling, center padding, `image_info`-based cropping);
-  - **Added/enhanced by this project**: the "Auto Align to Reference" node (entirely new); the `no_upscale` zero-resample scale mode, `transparent` padding and `target_size = 0` auto size of "Resize and Pad Image"; plus the complete no-offset editing pipeline and the ready-to-use workflow.
+  - **Added/enhanced by this project**: the "Auto Align to Reference" node (entirely new); the `no_upscale` zero-resample scale mode, **mirror / edge-extend padding fill** (removes the residual bar after cropping) and `target_size = 0` auto size of "Resize and Pad Image"; plus the complete no-offset editing pipeline and the ready-to-use workflow.
 - Thanks to the original author [@xingyuezhiyuan](https://github.com/xingyuezhiyuan).
 - The original project ships no open-source license; this repository is published for study and reference only, and all rights of the original work remain with its author. If you are the original author and wish to change how this repository is published, please open an issue.

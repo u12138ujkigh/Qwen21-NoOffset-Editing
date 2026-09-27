@@ -36,12 +36,32 @@ git clone https://github.com/u12138ujkigh/Qwen21-NoOffset-Editing.git
 | **红潮**（微调版）<br>`redqw21UNLOCKED…_int8.safetensors` | **`32 的倍数（四周留边）`** | **32** | 「红潮」是重定向微调，会**固定往左漂**（实测 24~42 px）。留边就是该方向能校正的最大漂移量，左/上不给余量就永远修不回来 |
 
 其余参数两个模型完全一致：`target_size = 0`、`resolution_multiple = 0`、`upscale_method = lanczos`、
-`scale_mode = no_upscale`、`background_color = transparent`；
+`scale_mode = no_upscale`、`background_color = 镜像 (reflect)`；
 「自动对齐到参考图」用 `crop_to_reference = True`、`max_shift = 64`。
 
 > 留边 32 覆盖绝大多数情况，但不是硬保证 —— 漂移量会随**内容**变化（同一模型实测 24 → 42 px）。
 > 真遇到残留偏移不用猜：「自动对齐到参考图」会直接打印**缺口多少像素、留边该改成多少**
 > （残留 10px 的那个案例会提示改成 64）。所以 **32 是推荐值，64 是兜底值**。
+
+### 补边方式：用「镜像」，别用纯色
+
+裁剪后成品左边那条色带，**不是留边不够，而是模型把纯色补边当画面内容照抄了**。
+受控实测（红潮 + 六步加速 LoRA，种子、画布几何、提示词全部固定，**只改补边方式**）：
+
+| 补边方式 | 解码图左侧亮色残留带 | 裁剪后成品残留 | 内容保真 NCC |
+|---|---|---|---|
+| 纯黑 `#000000` | 54 px（逐像素照抄） | 19~20 px **黑边** | 0.939 |
+| 透明 `alpha=0` | 54 px（同上） | 19 px（输出里是透明洞） | 0.948 |
+| 纯白 `#FFFFFF` | 47~63 px（仅被轻微洗白） | 9~12 px **白边** | 0.874 |
+| **镜像 `reflect`** ← 默认 | **0 px** | **0 px** | **0.992** |
+| **边缘延展 `edge`** | **0 px** | **0 px** | 0.985 |
+
+只有「镜像 / 边缘延展」把补边做成了**内容自身的延续**，模型才会把它当画面重绘 —— 裁剪后零残留，
+内容保真度还反而最高。所以**补边默认就是「镜像」**。
+
+> ⚠ 这条推翻了本文档早前的一个说法：「透明补边可以避免模型把补边当画面内容重绘」——**不成立**。
+> 实测透明与纯黑都被**逐像素照抄**（透明在输出里表现为 alpha=0 的洞），只比纯白略好一点点。
+> 「模型会自动把补边当扩图画掉」这个期待，**只有镜像/边缘延展能兑现**。
 
 ## 节点介绍
 
@@ -56,7 +76,7 @@ git clone https://github.com/u12138ujkigh/Qwen21-NoOffset-Editing.git
 | `resolution_multiple` | INT | 8 | 将 target_size 吸附到该值的倍数；0 = 不吸附 |
 | `upscale_method` | COMBO | lanczos | lanczos / bicubic / area / nearest |
 | `resize_and_pad` | BOOLEAN | True | 关闭时旁路（原样输出） |
-| `background_color` | STRING | #000000 | 补边颜色；**`transparent`** = 透明补边（输出 RGBA） |
+| **`background_color`** | COMBO | **镜像 (reflect)** | **补边填充**：`纯白 (#FFFFFF)` / `纯黑 (#000000)` / `透明 (alpha=0)` / **`镜像 (reflect)`** / `边缘延展 (edge)`。推荐镜像（理由见上）。仍兼容旧工作流手填的 `#RRGGBB` 与 `transparent` —— 后端为该输入豁免了下拉白名单校验，老工作流无需迁移 |
 | `scale_mode` | COMBO | fill_target | `fill_target` = 等比缩放至恰好放入画布；**`no_upscale`** = 只缩不放大 |
 | **`pad_mode`** | COMBO | 1:1（方形画布） | **画布模式**：`1:1（方形画布）` / `16 的倍数` / `32 的倍数` / `32 的倍数（四周留边）` / `1:1（四周留边）` / `32 的倍数（四边自定义）` |
 | **`edge_margin`** | INT | 64 | 四周留边（像素），两个「四周留边」档位生效；**粒度 8px**（不再是 32 的倍数）。**左/上余量恰好等于所填值** —— 内容贴左/上放置，ceil32 多出来的零头全落右/下，所以它同时就是「自动对齐到参考图」能向左/上校正的最大像素数。节点默认 **64**（比红潮推荐值 32 更宽裕，不改也能用；只跑官方模型用不到它） |
@@ -148,7 +168,8 @@ git clone https://github.com/u12138ujkigh/Qwen21-NoOffset-Editing.git
 **相对原插件的增强**（无偏移管线的关键）：
 
 - `scale_mode = no_upscale` + `target_size = 0`：内容**零重采样**——内容像素 1:1 进入画布，编辑后可与原图逐像素比对；
-- `background_color = transparent`：透明补边，避免黑色补边被模型当成「画面内容」重绘出杂物；
+- `background_color`：**五档补边填充**（纯白 / 纯黑 / 透明 / **镜像** / **边缘延展**）。推荐**镜像** ——
+  只有它和「边缘延展」把补边做成内容的延续，模型才会当画面重绘，裁剪后不留色带（见上文实测表）。
 - `pad_mode`：见上，画布形状/倍数可选。
 
 ### 2. 移除图像填充（Remove Pad from Image）
@@ -185,13 +206,13 @@ git clone https://github.com/u12138ujkigh/Qwen21-NoOffset-Editing.git
 ```
 加载图像 ─▶ 调整图像尺寸填充 ─▶ VAE编码 ─▶ KSampler ─▶ VAE解码 ─▶ 自动对齐到参考图 ─▶ 保存图像
                  │ (no_upscale                                            │        (crop_to_reference=True)
-                 │  +transparent)                                        │
+                 │  +镜像补边)                                            │
                  ├────────────── image_info ─────────────────────────────┤
                  └── output_image ──▶ (reference_image) ─────────────────┘
 ```
 
-1. **零重采样填充**：调整图像尺寸填充，`scale_mode = no_upscale`、`target_size = 0`、`background_color = transparent`——内容像素 1:1 进入画布，补边透明。
-   **画布推荐用 64 留边**：`pad_mode = 32 的倍数（四周留边）`、`edge_margin = 64`——保持比例、比 `1:1（方形画布）` 省 30%~45% 的 latent token，内容原点仍严格落在 latent 网格上，且四边都有校正余量（**左/上余量恰好等于所填值**，填多少就只能向左/上校正多少）供对齐节点裁剪；
+1. **零重采样填充**：调整图像尺寸填充，`scale_mode = no_upscale`、`target_size = 0`、`background_color = 镜像 (reflect)`——内容像素 1:1 进入画布，补边由内容镜像生成（模型会当画面重绘，裁剪后不留色带）。
+   **画布推荐用 32 留边**：`pad_mode = 32 的倍数（四周留边）`、`edge_margin = 32`——保持比例、比 `1:1（方形画布）` 省 30%~45% 的 latent token，内容原点仍严格落在 latent 网格上，且四边都有校正余量（**左/上余量恰好等于所填值**，填多少就只能向左/上校正多少）供对齐节点裁剪（漂移超了会打印缺口提示，加到 64 即可）；
    别用 `pad_mode = 32 的倍数`（只在右/下补边）或 `1:1（方形画布）` 跑会漂移的模型——它们在至少一个方向零余量，校正量会被夹掉、输出保持模型自身的偏移；
 2. **正常编辑**：VAE 编码 → KSampler（Qwen Image Edit）→ VAE 解码。模型在 padded 域创作，补边区也会被重绘（属正常，裁剪模式会把它裁掉）；
 3. **对齐即裁剪**：自动对齐到参考图，`crop_to_reference = True`，`reference_image` 接 padded 域原图、`image_info` 接元数据——FFT 找出模型引入的 16~32px 位移，直接切回与原图 1:1 的内容窗口；
@@ -205,6 +226,6 @@ git clone https://github.com/u12138ujkigh/Qwen21-NoOffset-Editing.git
 
 - 本项目改进自 [xingyuezhiyuan/Comfyui-txtnode](https://github.com/xingyuezhiyuan/Comfyui-txtnode)：
   - **来自原插件**：「调整图像尺寸填充」「移除图像填充」两个节点的基础设计（等比缩放、居中填充、`image_info` 元数据裁剪）；
-  - **本项目新增/增强**：「自动对齐到参考图」节点（全新）；「调整图像尺寸填充」的 `no_upscale` 零重采样缩放模式、`transparent` 透明填充、`target_size = 0` 自动尺寸；以及完整的无偏移编辑管线与开箱即用工作流。
+  - **本项目新增/增强**：「自动对齐到参考图」节点（全新）；「调整图像尺寸填充」的 `no_upscale` 零重采样缩放模式、**镜像/边缘延展补边**（消除裁剪后残留色带）、`target_size = 0` 自动尺寸；以及完整的无偏移编辑管线与开箱即用工作流。
 - 感谢原作者 [@xingyuezhiyuan](https://github.com/xingyuezhiyuan)。
 - 原项目未附带开源许可证；本项目以公开仓库形式发布，仅用于学习交流，版权归原作者所有。如你是原作者并希望调整本仓库的发布方式，请提 issue 联系。

@@ -1116,7 +1116,7 @@
         0,
         "lanczos",
         true,
-        "transparent",
+        "镜像 (reflect)｜推荐",
         "no_upscale",
         "32 的倍数（四周留边）",
         32
@@ -1126,7 +1126,7 @@
         "resolution_multiple": 0,
         "upscale_method": "lanczos",
         "resize_and_pad": true,
-        "background_color": "transparent",
+        "background_color": "镜像 (reflect)｜推荐",
         "scale_mode": "no_upscale",
         "pad_mode": "32 的倍数（四周留边）",
         "edge_margin": 32

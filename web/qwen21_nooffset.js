@@ -57,6 +57,45 @@ function domOf(widget) {
     return null;
 }
 
+// ---------------------------------------------------------------- 补边颜色的历史值迁移
+// 「补边颜色」原本是自由字符串，老工作流里存着 "#FFFFFF" / "transparent"。改成下拉后，
+// 后端已为该输入豁免了下拉白名单校验（节点里的 validate_inputs），所以**旧值照样能跑**；
+// 这里只是把控件里显示的值就地翻译成新选项，免得下拉停在空档上。
+const BG_WIDGET = "background_color";
+const BG_ALIASES = [
+    [/^(#?)(f{3}|f{6})$/i, "纯白 (#FFFFFF)"],
+    [/^(#?)(0{3}|0{6})$/, "纯黑 (#000000)"],
+    [/^(transparent|none|alpha|clear)$/i, "透明 (alpha=0)"],
+    [/^纯白/, "纯白 (#FFFFFF)"],
+    [/^纯黑/, "纯黑 (#000000)"],
+    [/^透明/, "透明 (alpha=0)"],
+    [/^(reflect|mirror|mirrored)$/i, "镜像 (reflect)｜推荐"],
+    [/^(edge|replicate|clamp)$/i, "边缘延展 (edge)"],
+];
+
+function bgOptions(widget) {
+    const o = widget && widget.options;
+    if (!o) return null;
+    if (Array.isArray(o)) return o;
+    if (Array.isArray(o.values)) return o.values;
+    return null;
+}
+
+function normalizeBackground(node) {
+    const w = findWidget(node, BG_WIDGET);
+    if (!w) return;
+    if (w.value === null || w.value === undefined) return;   // 控件还没被赋值，别乱猜
+    const opts = bgOptions(w);
+    if (opts && opts.includes(w.value)) return;              // 已是合法选项
+
+    const raw = String(w.value).trim();
+    if (raw === "") { w.value = "透明 (alpha=0)"; return; }  // 旧语义：留空 = 透明
+    for (const [re, label] of BG_ALIASES) {
+        if (re.test(raw)) { w.value = label; return; }
+    }
+    // 其余历史写法（如 #abc）保持原样：后端 _resolve_background 认它
+}
+
 /** 置灰 + 锁定一个控件；返回是否发生了变化（用于决定要不要重绘画布）。 */
 function setLocked(widget, locked, tip) {
     if (!widget) return false;
@@ -112,6 +151,7 @@ function applyMode(node) {
 function bindNode(node) {
     if (!node) return;
     injectStyle();
+    normalizeBackground(node);
     if (!node.__qnoBound) {
         node.__qnoBound = true;
         for (const name of ["pad_mode", "resize_and_pad"]) {
